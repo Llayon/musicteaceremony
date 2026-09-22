@@ -51,6 +51,11 @@ export const RhythmGame: React.FC = () => {
   const [isLoadingAudio, setIsLoadingAudio] = useState<boolean>(false);
   const [audioError, setAudioError] = useState<string | null>(null);
   const [activeTrackLabel, setActiveTrackLabel] = useState<string>('default song');
+  // Start-time loading display: fetch % when the song is still downloading,
+  // stage text otherwise. Never blocks the game: any load failure falls
+  // back to the badged dev guide loop so Start always resolves.
+  const [loadProgress, setLoadProgress] = useState<number | null>(null);
+  const [loadStageText, setLoadStageText] = useState<string | null>(null);
 
   // Dedicated SFX / Rhythm Cues Volume (0 to 1.5)
   const [sfxVolume, setSfxVolume] = useState<number>(1.2);
@@ -221,6 +226,21 @@ export const RhythmGame: React.FC = () => {
     cancelGameLoop();
     setIsLoadingAudio(true);
     setAudioError(null);
+    setLoadProgress(null);
+    // Honest loading text: decoding when bytes are cached, download % while
+    // the fetch is still running. Either way Start always resolves — load
+    // failure falls back to the badged dev guide loop below.
+    setLoadStageText(audio.isPreloaded() ? 'Декодируем аудио…' : 'Загрузка музыки…');
+
+    // Progress subscription (unsubscribed in finally). Chunks arrive a few
+    // dozen times per download — event-driven, not a render loop.
+    const unsubscribeFetchProgress = audio.subscribeFetchProgress((p) => {
+      if (p.total) {
+        const fraction = Math.min(1, p.received / p.total);
+        setLoadProgress(fraction);
+        setLoadStageText(`Загрузка музыки… ${Math.round(fraction * 100)}%`);
+      }
+    });
 
     try {
       // First user gesture triggers audio context resume
@@ -259,6 +279,7 @@ export const RhythmGame: React.FC = () => {
           trackBuffer = audio.generateDevGuideLoop(ZEN_CHART_METADATA.bpm);
           loop = true;
           setActiveTrackLabel('dev guide loop (asset missing — see public/audio/README)');
+          setLoadStageText('Не удалось загрузить музыку — играем на метрономе');
         }
       }
 
@@ -278,7 +299,10 @@ export const RhythmGame: React.FC = () => {
       console.error('[RhythmGame] Failed to start round:', err);
       setAudioError(err instanceof Error ? err.message : 'Failed to start audio');
     } finally {
+      unsubscribeFetchProgress();
       setIsLoadingAudio(false);
+      setLoadProgress(null);
+      setLoadStageText(null);
     }
   };
 
@@ -575,7 +599,11 @@ export const RhythmGame: React.FC = () => {
               disabled={isLoadingAudio}
               className="px-8 py-3.5 rounded-xl bg-gradient-to-r from-[#6E9855] to-[#487334] text-white font-bold text-sm tracking-wider uppercase shadow-lg shadow-[#487334]/40 hover:brightness-110 active:scale-95 transition-transform disabled:opacity-60"
             >
-              {isLoadingAudio ? 'Загрузка аудио…' : 'Коснитесь экрана для старта'}
+              {isLoadingAudio
+                ? loadProgress !== null
+                  ? `Загрузка музыки… ${Math.round(loadProgress * 100)}%`
+                  : loadStageText ?? 'Загрузка аудио…'
+                : 'Коснитесь экрана для старта'}
             </button>
             {audioError && (
               <p className="mt-3 text-[11px] text-red-400 max-w-[280px]">{audioError}</p>
@@ -645,7 +673,13 @@ export const RhythmGame: React.FC = () => {
               }}
             >
               <RotateCcw className="w-4 h-4" />
-              <span>{isLoadingAudio ? 'Загрузка…' : 'Заварить еще раз'}</span>
+              <span>
+                {isLoadingAudio
+                  ? loadProgress !== null
+                    ? `Загрузка… ${Math.round(loadProgress * 100)}%`
+                    : loadStageText ?? 'Загрузка…'
+                  : 'Заварить еще раз'}
+              </span>
             </button>
           </div>
         )}

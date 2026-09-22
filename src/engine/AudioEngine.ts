@@ -1,6 +1,7 @@
 import type { ChartEvent } from '../types';
 import { TimingClock } from './TimingClock';
 import { DEFAULT_TRACK_URL } from './defaultTrack';
+import { fetchBytesWithProgress, type FetchBytesProgress } from './fetchBytes';
 import { perfMark } from './perf';
 
 /** Telemetry-only loading stage (never drives game logic). */
@@ -50,9 +51,13 @@ export class AudioEngine {
 
   // Stage 1 preload cache: raw MP3 bytes fetched in background on page open.
   // No AudioContext is touched here (autoplay-safe). Single-flight.
+  // Every fetch is stall-bounded (see fetchBytes): a dead connection settles
+  // instead of hanging Start forever.
   private preloadPromise: Promise<ArrayBuffer> | null = null;
   private preloadedBytes: ArrayBuffer | null = null;
   private loadStage: AudioLoadStage = 'idle';
+  private lastFetchProgress: FetchBytesProgress | null = null;
+  private fetchProgressListeners = new Set<(p: FetchBytesProgress) => void>();
 
   // Lifecycle: suppress the onended callback for manual stops so a manual
   // stop never produces a duplicate "completed" callback.
@@ -197,14 +202,18 @@ export class AudioEngine {
 
     this.loadStage = 'downloading';
     perfMark('audio-fetch-start');
-    this.preloadPromise = fetch(DEFAULT_TRACK_URL).then(async (response) => {
-      if (!response.ok) {
-        throw new Error(
-          `Default track asset missing at ${DEFAULT_TRACK_URL} ` +
-            `(HTTP ${response.status}). See public/audio/README.md.`
-        );
-      }
-      const bytes = await response.arrayBuffer();
+    this.preloadPromise = fetchBytesWithProgress(DEFAULT_TRACK_URL, {
+      onProgress: (p) => {
+        this.lastFetchProgress = p;
+        for (const cb of this.fetchProgressListeners) {
+          try {
+            cb(p);
+          } catch {
+            // Listener errors must never break loading.
+          }
+        }
+      },
+    }).then((bytes) => {
       this.preloadedBytes = bytes;
       perfMark('audio-fetch-end');
       return bytes;
@@ -220,6 +229,35 @@ export class AudioEngine {
   public getLoadStage(): AudioLoadStage {
     if (this.defaultBuffer) return 'ready';
     return this.loadStage;
+  }
+
+  /** True when default-song bytes are already cached (Start = decode only). */
+  public isPreloaded(): boolean {
+    return this.preloadedBytes !== null || this.defaultBuffer !== null;
+  }
+
+  /** Last known fetch progress (null before any bytes arrive). */
+  public getFetchProgress(): FetchBytesProgress | null {
+    return this.lastFetchProgress;
+  }
+
+  /**
+   * Subscribe to fetch progress (for Start-button % display). The callback
+   * fires only while a fetch is actually running. Returns an unsubscribe.
+   */
+  public subscribeFetchProgress(cb: (p: FetchBytesProgress) => void): () => void {
+    this.fetchProgressListeners.add(cb);
+    const current = this.lastFetchProgress;
+    if (current) {
+      try {
+        cb(current);
+      } catch {
+        // Listener errors must never break loading.
+      }
+    }
+    return () => {
+      this.fetchProgressListeners.delete(cb);
+    };
   }
 
   /**
