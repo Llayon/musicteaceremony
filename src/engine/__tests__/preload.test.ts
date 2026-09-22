@@ -28,15 +28,26 @@ function fakeWindow(decodeAudioData: (bytes: ArrayBuffer) => Promise<AudioBuffer
   const gainNode = () => ({ gain: { setValueAtTime: () => {} }, connect: () => {} });
   return {
     AudioContext: function () {
-      return {
+      const ctx: {
+        currentTime: number;
+        state: string;
+        sampleRate: number;
+        destination: object;
+        resume: () => Promise<void>;
+        createGain: () => { gain: { setValueAtTime: () => void }; connect: () => void };
+        decodeAudioData: (bytes: ArrayBuffer) => Promise<AudioBuffer>;
+      } = {
         currentTime: 100,
         state: 'suspended',
         sampleRate: 48000,
         destination: {},
-        resume: resume ?? (async () => {}),
+        resume: resume ?? (async () => {
+          ctx.state = 'running';
+        }),
         createGain: gainNode,
         decodeAudioData,
       };
+      return ctx;
     },
   } as unknown as Window & typeof globalThis;
 }
@@ -200,8 +211,18 @@ describe('default-track preload (stage 1: fetch-only, no AudioContext)', () => {
   });
 
   it('interrupted state triggers resume (not just suspended)', async () => {
-    const resume = vi.fn(async () => {});
-    const ctx = {
+    const resume = vi.fn(async () => {
+      ctx.state = 'running';
+    });
+    const ctx: {
+      currentTime: number;
+      state: string;
+      sampleRate: number;
+      destination: object;
+      resume: () => Promise<void>;
+      createGain: () => { gain: { setValueAtTime: () => void }; connect: () => void };
+      decodeAudioData: (bytes: ArrayBuffer) => Promise<AudioBuffer>;
+    } = {
       currentTime: 0,
       state: 'interrupted',
       sampleRate: 48000,
@@ -234,6 +255,65 @@ describe('default-track preload (stage 1: fetch-only, no AudioContext)', () => {
     const engine = new AudioEngine();
     await engine.resumeContext();
     expect(resume).not.toHaveBeenCalled();
+  });
+
+  it('sync unlock fires resume in-gesture without awaiting (no-op when running)', async () => {
+    const resume = vi.fn(async () => {});
+    const ctx = {
+      currentTime: 0,
+      state: 'suspended' as string,
+      sampleRate: 48000,
+      destination: {},
+      resume: () => {
+        ctx.state = 'running';
+        return resume();
+      },
+      createGain: () => ({ gain: { setValueAtTime: () => {} }, connect: () => {} }),
+      decodeAudioData: async () => ({ duration: 1 }) as AudioBuffer,
+    };
+    vi.stubGlobal('window', { AudioContext: function () { return ctx; } } as unknown as Window & typeof globalThis);
+
+    const engine = new AudioEngine();
+    engine.unlockSynchronously();
+    expect(resume).toHaveBeenCalledTimes(1);
+    engine.unlockSynchronously();
+    expect(resume).toHaveBeenCalledTimes(1); // already running -> no-op
+    expect(engine.getStartupLog().join('\n')).toMatch(/sync unlock attempted/);
+  });
+
+  it('sync unlock tolerates legacy webkit resume() returning void', () => {
+    const ctx = {
+      currentTime: 0,
+      state: 'suspended',
+      sampleRate: 48000,
+      destination: {},
+      resume: () => undefined,
+      createGain: () => ({ gain: { setValueAtTime: () => {} }, connect: () => {} }),
+      decodeAudioData: async () => ({ duration: 1 }) as AudioBuffer,
+    };
+    vi.stubGlobal('window', { AudioContext: function () { return ctx; } } as unknown as Window & typeof globalThis);
+
+    const engine = new AudioEngine();
+    expect(() => engine.unlockSynchronously()).not.toThrow();
+  });
+
+  it('resume resolving with a still-dead context throws an actionable error', async () => {
+    const resume = vi.fn(async () => {
+      // Resolves, but the context stays suspended (broken WebView).
+    });
+    const ctx = {
+      currentTime: 0,
+      state: 'suspended',
+      sampleRate: 48000,
+      destination: {},
+      resume,
+      createGain: () => ({ gain: { setValueAtTime: () => {} }, connect: () => {} }),
+      decodeAudioData: async () => ({ duration: 1 }) as AudioBuffer,
+    };
+    vi.stubGlobal('window', { AudioContext: function () { return ctx; } } as unknown as Window & typeof globalThis);
+
+    const engine = new AudioEngine();
+    await expect(engine.resumeContext()).rejects.toThrow('did not start');
   });
 
   it('timed-out stereo orphan is dropped, never cached alongside light', async () => {

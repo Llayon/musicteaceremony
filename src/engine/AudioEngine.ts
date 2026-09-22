@@ -29,6 +29,11 @@ export interface StartupLogEntry {
   event: string;
 }
 
+/** Un-narrowed context-state read (see resumeContext). */
+function readContextState(ctx: AudioContext): AudioContextState {
+  return ctx.state;
+}
+
 /**
  * Decode watchdog per attempt: past this the attempt fails over to the next
  * layer instead of waiting forever (decodeAudioData cannot be aborted).
@@ -172,13 +177,7 @@ export class AudioEngine {
     // Lazily initialized on pointerdown
   }
 
-  /**
-   * Initializes or resumes AudioContext to bypass mobile autoplay restrictions.
-   * Resume is attempted for ANY non-running state (suspended AND WebKit's
-   * 'interrupted' — checking only 'suspended' silently skips the resume call
-   * on iOS and hands a dead context downstream).
-   */
-  public async resumeContext(): Promise<AudioContext> {
+  private ensureContext(): AudioContext {
     if (!this.audioCtx) {
       const AudioCtxClass =
         window.AudioContext ||
@@ -194,13 +193,54 @@ export class AudioEngine {
       this.clock.attach(this.audioCtx);
       this.logStartup(`AudioContext created (state=${this.audioCtx.state})`);
     }
+    return this.audioCtx;
+  }
 
-    if (this.audioCtx.state !== 'running') {
-      const before = this.audioCtx.state;
+  /**
+   * Synchronous in-gesture unlock attempt. Call FIRST in the pointerdown
+   * handler, before any async work: iOS Safari honors resume() best when it
+   * is invoked synchronously inside the user gesture, not after awaits.
+   * Fire-and-forget by design — the awaited resumeContext() later verifies.
+   * Safe to call on every tap (no-op when already running).
+   */
+  public unlockSynchronously(): void {
+    try {
+      const ctx = this.ensureContext();
+      if (ctx.state === 'running') return;
+      this.logStartup(`sync unlock attempted (state=${ctx.state})`);
+      const result = ctx.resume() as unknown;
+      // Old webkitAudioContext.resume() returns void, not a promise.
+      if (result && typeof (result as Promise<void>).then === 'function') {
+        (result as Promise<void>).then(
+          () => this.logStartup(`sync unlock resolved (state=${ctx.state})`),
+          (err: unknown) =>
+            this.logStartup(`sync unlock rejected: ${err instanceof Error ? err.message : String(err)}`)
+        );
+      }
+    } catch (err) {
+      this.logStartup(
+        `sync unlock threw: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
+  /**
+   * Initializes or resumes AudioContext to bypass mobile autoplay restrictions.
+   * Resume is attempted for ANY non-running state (suspended AND WebKit's
+   * 'interrupted' — checking only 'suspended' silently skips the resume call
+   * on iOS and hands a dead context downstream). After resume resolves the
+   * state is VERIFIED: a resolved promise with a still-dead context throws
+   * an actionable error instead of starting a silently frozen game.
+   */
+  public async resumeContext(): Promise<AudioContext> {
+    const ctx = this.ensureContext();
+
+    if (ctx.state !== 'running') {
+      const before = ctx.state;
       this.logStartup(`resume called (state before=${before})`);
       try {
         await withTimeout(
-          this.audioCtx.resume(),
+          ctx.resume(),
           RESUME_TIMEOUT_MS,
           () =>
             new Error(
@@ -214,10 +254,21 @@ export class AudioEngine {
         );
         throw err;
       }
-      this.logStartup(`resume resolved (state after=${this.audioCtx.state})`);
+      this.logStartup(`resume resolved (state after=${ctx.state})`);
+      // Read through a helper: direct comparison would hit control-flow
+      // narrowing (the pre-await check excluded 'running' from ctx.state).
+      const after = readContextState(ctx);
+      if (after !== 'running') {
+        const msg =
+          `Audio did not start (context state="${after}" after resume). ` +
+          `На iPhone помогает: повторный тап по Start, перезагрузка страницы, ` +
+          `Safari напрямую вместо встроенного браузера.`;
+        this.logStartup(`resume ineffective: state=${after}`);
+        throw new Error(msg);
+      }
     }
 
-    return this.audioCtx;
+    return ctx;
   }
 
   public getTimingClock(): TimingClock {

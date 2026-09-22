@@ -353,6 +353,10 @@ export const RhythmGame: React.FC = () => {
   const handlePointerDown = (e: React.PointerEvent) => {
     e.preventDefault();
 
+    // Synchronous in-gesture unlock FIRST: iOS Safari honors resume() best
+    // when called directly in the tap, not after awaits. No-op when running.
+    audioEngineRef.current?.unlockSynchronously();
+
     if (gameState === 'IDLE' || gameState === 'FINISHED') {
       void startRound();
       return;
