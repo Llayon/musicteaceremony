@@ -1,6 +1,6 @@
 import type { ChartEvent } from '../types';
 import { TimingClock } from './TimingClock';
-import { DEFAULT_TRACK_URL } from './defaultTrack';
+import { DEFAULT_TRACK_URL, LIGHT_TRACK_URL } from './defaultTrack';
 import { fetchBytesWithProgress, withTimeout, type FetchBytesProgress } from './fetchBytes';
 import { perfMark } from './perf';
 
@@ -8,10 +8,16 @@ import { perfMark } from './perf';
 export type AudioLoadStage = 'idle' | 'downloading' | 'decoding' | 'ready' | 'error';
 
 /**
- * Decode watchdog: past this the game starts on the fallback loop instead
- * of waiting forever (decodeAudioData cannot be aborted).
+ * Decode watchdog per attempt: past this the attempt fails over to the next
+ * layer instead of waiting forever (decodeAudioData cannot be aborted).
  */
-export const DECODE_TIMEOUT_MS = 60_000;
+export const DECODE_TIMEOUT_MS = 30_000;
+
+/**
+ * Sound-unlock watchdog: resume() outside a honored gesture can pend
+ * forever on some WebViews. Past this we fail loudly instead of hanging.
+ */
+export const RESUME_TIMEOUT_MS = 10_000;
 
 export interface StartTrackOptions {
   /** Loop the buffer (used for the dev guide-loop fallback). Default false. */
@@ -54,6 +60,10 @@ export class AudioEngine {
 
   private defaultBuffer: AudioBuffer | null = null;
   private defaultPromise: Promise<AudioBuffer> | null = null;
+  // Light mono fallback (weak phones): fetched on demand, cached per session.
+  private lightBytes: ArrayBuffer | null = null;
+  private lightBuffer: AudioBuffer | null = null;
+  private lastUsedLight = false;
 
   // Stage 1 preload cache: raw MP3 bytes fetched in background on page open.
   // No AudioContext is touched here (autoplay-safe). Single-flight.
@@ -99,7 +109,15 @@ export class AudioEngine {
     }
 
     if (this.audioCtx.state === 'suspended') {
-      await this.audioCtx.resume();
+      await withTimeout(
+        this.audioCtx.resume(),
+        RESUME_TIMEOUT_MS,
+        () =>
+          new Error(
+            'Sound unlock timed out: the browser did not resume audio. ' +
+              'Tap Start again (a real tap, not auto-play).'
+          )
+      );
     }
 
     return this.audioCtx;
@@ -196,6 +214,23 @@ export class AudioEngine {
     this.customName = null;
   }
 
+  private notifyFetchProgress(p: FetchBytesProgress): void {
+    this.lastFetchProgress = p;
+    for (const cb of this.fetchProgressListeners) {
+      try {
+        cb(p);
+      } catch {
+        // Listener errors must never break loading.
+      }
+    }
+  }
+
+  private async fetchTrackBytes(url: string): Promise<ArrayBuffer> {
+    return fetchBytesWithProgress(url, {
+      onProgress: (p) => this.notifyFetchProgress(p),
+    });
+  }
+
   /**
    * Stage 1 — background preload (call on page open, no gesture needed):
    * fetches the default-song bytes while the user reads the start screen.
@@ -208,18 +243,7 @@ export class AudioEngine {
 
     this.loadStage = 'downloading';
     perfMark('audio-fetch-start');
-    this.preloadPromise = fetchBytesWithProgress(DEFAULT_TRACK_URL, {
-      onProgress: (p) => {
-        this.lastFetchProgress = p;
-        for (const cb of this.fetchProgressListeners) {
-          try {
-            cb(p);
-          } catch {
-            // Listener errors must never break loading.
-          }
-        }
-      },
-    }).then((bytes) => {
+    this.preloadPromise = this.fetchTrackBytes(DEFAULT_TRACK_URL).then((bytes) => {
       this.preloadedBytes = bytes;
       perfMark('audio-fetch-end');
       return bytes;
@@ -269,51 +293,44 @@ export class AudioEngine {
   /**
    * Async production path: decode the pre-rendered default song.
    * Stage 2 — runs on Start (after the user gesture): reuses preloaded
-   * bytes when available, otherwise fetches first. Throws when the asset
-   * is missing so callers can fall back explicitly (dev guide loop)
-   * instead of silently synthesizing 160 s on the tap path.
+   * bytes when available, otherwise fetches first.
    *
-   * Decode watchdog: decodeAudioData has no abort API and can stall
-   * indefinitely on low-memory phones (159 s stereo is ~120 MB PCM).
-   * Past DECODE_TIMEOUT_MS the race rejects → caller falls back and the
-   * game starts; a late-resolving decode still caches for the next round.
+   * Layered fallback (weak phones): full stereo first; when its fetch or
+   * decode fails, the light mono mix (~30 MB PCM instead of ~122 MB) is
+   * tried automatically. Only when both fail does the caller fall back to
+   * the badged dev guide loop. Throws in that case — never hangs: fetch
+   * is stall-bounded and each decode is watchdogged (decodeAudioData has
+   * no abort API). A late-resolving decode still warms the cache.
    */
   public async loadDefaultTrack(): Promise<AudioBuffer> {
     if (this.defaultBuffer) return this.defaultBuffer;
+    if (this.lightBuffer) return this.lightBuffer;
     if (this.defaultPromise) return this.defaultPromise;
 
     this.defaultPromise = (async () => {
       const ctx = await this.resumeContext();
       this.loadStage = 'decoding';
       perfMark('audio-decode-start');
-      const bytes = this.preloadedBytes ?? (await this.preloadDefaultTrackBytes());
-      // Slice: decodeAudioData may detach the input in some browsers —
-      // the cached copy stays intact for potential re-decodes.
-      const decodePromise = ctx.decodeAudioData(bytes.slice(0));
-      // A late success still warms the cache for the next round.
-      void decodePromise.then(
-        (buf) => {
-          if (!this.defaultBuffer) {
-            this.defaultBuffer = buf;
-          }
-        },
-        () => {
-          // Already handled via the race below; never unhandled.
+      try {
+        const bytes = this.preloadedBytes ?? (await this.preloadDefaultTrackBytes());
+        const decoded = await this.decodeAndCache(ctx, bytes, false);
+        this.lastUsedLight = false;
+        return decoded;
+      } catch (stereoErr) {
+        // Layer 2: light mono mix. Kinder to weak-phone decoders.
+        perfMark('audio-light-fallback');
+        this.lastFetchProgress = null;
+        const lightBytes =
+          this.lightBytes ?? (await this.fetchTrackBytes(LIGHT_TRACK_URL));
+        this.lightBytes = lightBytes;
+        try {
+          const decoded = await this.decodeAndCache(ctx, lightBytes, true);
+          this.lastUsedLight = true;
+          return decoded;
+        } catch (lightErr) {
+          throw lightErr instanceof Error ? lightErr : stereoErr;
         }
-      );
-      const decoded = await withTimeout(
-        decodePromise,
-        DECODE_TIMEOUT_MS,
-        () =>
-          new Error(
-            `Decoding the default track took longer than ${(DECODE_TIMEOUT_MS / 1000).toFixed(0)} s — ` +
-              `this phone may be too slow for 159 s of stereo. Falling back.`
-          )
-      );
-      this.defaultBuffer = decoded;
-      this.loadStage = 'ready';
-      perfMark('audio-decode-end');
-      return decoded;
+      }
     })();
 
     try {
@@ -325,11 +342,51 @@ export class AudioEngine {
     }
   }
 
+  /** True when the resolved default track is the light mono mix. */
+  public usedLightTrack(): boolean {
+    return this.lastUsedLight;
+  }
+
+  private async decodeAndCache(
+    ctx: AudioContext,
+    bytes: ArrayBuffer,
+    light: boolean
+  ): Promise<AudioBuffer> {
+    // Slice: decodeAudioData may detach the input in some browsers —
+    // the cached copy stays intact for potential re-decodes.
+    const decodePromise = ctx.decodeAudioData(bytes.slice(0));
+    const store = (buf: AudioBuffer) => {
+      if (light) {
+        if (!this.lightBuffer) this.lightBuffer = buf;
+      } else if (!this.defaultBuffer) {
+        this.defaultBuffer = buf;
+      }
+    };
+    // A late success still warms the cache for the next round.
+    void decodePromise.then(store, () => {
+      // Already handled via the race below; never unhandled.
+    });
+    const decoded = await withTimeout(
+      decodePromise,
+      DECODE_TIMEOUT_MS,
+      () =>
+        new Error(
+          `Decoding the default track took longer than ${(DECODE_TIMEOUT_MS / 1000).toFixed(0)} s — ` +
+            `this phone may be too slow for 159 s of stereo. Falling back.`
+        )
+    );
+    store(decoded);
+    this.loadStage = 'ready';
+    perfMark('audio-decode-end');
+    return decoded;
+  }
+
   /** Active buffer duration in ms (0 when no track loaded). Source of truth. */
   public getTrackDurationMs(): number {
     if (this.trackBuffer) return this.trackBuffer.duration * 1000;
     if (this.customBuffer) return this.customBuffer.duration * 1000;
     if (this.defaultBuffer) return this.defaultBuffer.duration * 1000;
+    if (this.lightBuffer) return this.lightBuffer.duration * 1000;
     return 0;
   }
 

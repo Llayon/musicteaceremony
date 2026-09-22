@@ -230,10 +230,10 @@ export const RhythmGame: React.FC = () => {
     setAudioError(null);
     setLoadProgress(null);
     setLoadSlow(false);
-    // Honest loading text: decoding when bytes are cached, download % while
-    // the fetch is still running. Either way Start always resolves — load
-    // failure falls back to the badged dev guide loop below.
-    setLoadStageText(audio.isPreloaded() ? 'Декодируем аудио…' : 'Загрузка музыки…');
+    // Stage order matters for diagnosis: sound unlock first, then fetch /
+    // decode. A hang on "Включаем звук…" means the browser refused resume;
+    // a hang on "Декодируем…" means the decoder is stuck (watchdogged).
+    setLoadStageText('Включаем звук…');
 
     // Progress subscription (unsubscribed in finally). Chunks arrive a few
     // dozen times per download — event-driven, not a render loop.
@@ -256,8 +256,14 @@ export const RhythmGame: React.FC = () => {
     }, 25_000);
 
     try {
-      // First user gesture triggers audio context resume
+      // First user gesture triggers audio context resume (watchdogged —
+      // a refused unlock fails loudly instead of hanging Start).
       await audio.resumeContext();
+      // Honest loading text past this point: decoding when bytes are
+      // cached, download % while the fetch is still running. Either way
+      // Start always resolves — load failure falls back to the badged
+      // dev guide loop below.
+      setLoadStageText(audio.isPreloaded() ? 'Декодируем аудио…' : 'Загрузка музыки…');
 
       const freshEvents = getFreshChartEvents();
       setChartEvents(freshEvents);
@@ -276,7 +282,8 @@ export const RhythmGame: React.FC = () => {
 
       // Resolve the genuine active track:
       // 1) uploaded custom audio when present, 2) pre-rendered 90 BPM master
-      // (async), 3) tiny looped dev guide when the asset is absent.
+      // (stereo, then automatic light-mono fallback on weak phones),
+      // 3) tiny looped dev guide when audio genuinely cannot load.
       // Chart compatibility limit: the chart stays fixed to the 90 BPM
       // production groove — custom audio is NOT re-mapped and there is no
       // BPM detection or auto-beatmap generation.
@@ -287,7 +294,11 @@ export const RhythmGame: React.FC = () => {
       } else {
         try {
           trackBuffer = await audio.loadDefaultTrack();
-          setActiveTrackLabel('default song');
+          // Layered fallback may resolve the light mono mix on weak phones —
+          // same music, half the decode weight. Badged honestly.
+          setActiveTrackLabel(
+            audio.usedLightTrack() ? 'default song (light mix)' : 'default song'
+          );
         } catch {
           trackBuffer = audio.generateDevGuideLoop(ZEN_CHART_METADATA.bpm);
           loop = true;
