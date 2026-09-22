@@ -1,32 +1,39 @@
-# Default song asset (required for production gameplay)
+# Default song asset — "Rhodes & Rimshot Groove" (production music)
 
 Gauntlet 0 production start path loads a **pre-rendered audio file
 asynchronously** — it never synthesizes minutes of PCM synchronously when
 the player taps Start.
 
-## Required file
+## Committed file
 
 ```
 public/audio/zen-tea-ceremony.mp3
 ```
 
-Served at runtime as `/audio/zen-tea-ceremony.mp3` (see
-`src/engine/defaultTrack.ts` → `DEFAULT_TRACK_URL`).
+Served at runtime as `<base>/audio/zen-tea-ceremony.mp3` (see
+`src/engine/defaultTrack.ts` → `DEFAULT_TRACK_URL`, which resolves through
+`import.meta.env.BASE_URL` so local builds use `/` and GitHub Project Pages
+use `/musicteaceremony/`).
 
-## Spec
+## Verified spec (measured, not assumed)
 
-- Format: MP3 (or WAV/OGG the target browsers can decode), stereo
-- Sample rate: 44.1 kHz or 48 kHz
-- Tempo: 130 BPM, 4/4
-- Length: ~160 s to match `ZEN_CHART_METADATA.songLengthMs` (160000)
-- Content: the 4-part Zen mix the chart was authored against
-  (or any 130 BPM track if the chart is re-authored later)
+- Content: Rhodes & Rimshot Groove master (drums + bass + other; the
+  supplied vocals stem is digitally silent and is excluded)
+- Format: MP3, stereo, 48 kHz, ~192 kbps, 3 817 871 bytes
+- Duration: 159.018667 s (`songLengthMs: 159019`)
+- Tempo: 90 BPM, 4/4, constant end-to-end (drift ≈ −0.12 ms/s)
+- Grid: beat k at 40 + k × 666.666… ms; groove bar 1 = 10 040 ms
 
-## How to provide it
+No heavy mastering, compression, EQ, tempo stretching, or remixing was
+applied — the supplied mix is committed as-is.
 
-1. Render/export the 130 BPM mix to MP3.
-2. Place it at `public/audio/zen-tea-ceremony.mp3`.
-3. `npm run build` — Vite copies `public/` to `dist/` verbatim.
+## To replace the track
+
+1. Render/export the new mix to MP3.
+2. Overwrite `public/audio/zen-tea-ceremony.mp3`.
+3. Re-verify tempo/phase (see analysis notes in `src/data/zenChart.ts`)
+   and re-author the chart — timestamps are compiled from the 90 BPM grid.
+4. `npm run build` — Vite copies `public/` to `dist/` verbatim.
 
 ## Fallbacks (explicit, never silent)
 
@@ -39,5 +46,5 @@ Served at runtime as `/audio/zen-tea-ceremony.mp3` (see
   30 s and must not be called on the Start path.
 - Custom user uploads (MP3/WAV via the settings modal) genuinely become
   the active gameplay track through `setCustomTrackFromBytes()`. Chart
-  compatibility limit: the chart stays fixed 130 BPM — no BPM detection
-  or auto-beatmap is performed.
+  compatibility limit: the chart stays fixed to the 90 BPM production
+  groove — no BPM detection or auto-beatmap is performed.

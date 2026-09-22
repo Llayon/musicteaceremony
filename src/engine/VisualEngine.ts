@@ -60,18 +60,27 @@ export class VisualEngine {
   public static readonly VIRTUAL_HEIGHT = 640;
 
   // Dynamic tempo setting
-  private currentBpm: number = 130;
+  private currentBpm: number = 90;
 
-  // Approach time: exactly 2 musical beats for textbook Rhythm Heaven timing
+  // Anticipation in beats (chart config: 1.5 at 90 BPM = 1000 ms flight).
+  private approachBeats: number = 1.5;
+
+  // Approach time in ms, derived from the audio-clock tempo + chart config.
   public getApproachTimeMs(): number {
-    return (60000 / this.currentBpm) * 2;
+    return (60000 / this.currentBpm) * this.approachBeats;
   }
 
   public setBpm(bpm: number): void {
     this.currentBpm = bpm;
     if (this.steamAnimation) {
       // Sync steam animation speed to tempo
-      this.steamAnimation.animationSpeed = 0.13 * (bpm / 130);
+      this.steamAnimation.animationSpeed = 0.13 * (bpm / 90);
+    }
+  }
+
+  public setApproachBeats(beats: number): void {
+    if (Number.isFinite(beats) && beats > 0) {
+      this.approachBeats = beats;
     }
   }
 
@@ -234,7 +243,7 @@ export class VisualEngine {
       this.steamAnimation.anchor.set(0.5, 1.0);
       this.steamAnimation.position.set(this.targetX, this.targetY - 12);
       this.steamAnimation.scale.set(1.8);
-      // Speed synced to 120 BPM (2 beats per sec -> 4 frames per beat = 8 fps)
+      // Speed synced to 90 BPM (1.5 beats per sec -> 4 frames per beat ≈ 6 fps)
       this.steamAnimation.animationSpeed = 0.13;
       this.steamAnimation.play();
       this.gameLayer.addChild(this.steamAnimation);
@@ -339,7 +348,7 @@ export class VisualEngine {
       this.updateCupTexture(false);
     }
 
-    // 2. Musically synchronized Beat Bounce (130 BPM tempo anchoring)
+    // 2. Musically synchronized Beat Bounce (90 BPM tempo anchoring)
     const beatMs = 60000 / this.currentBpm;
     const beatPhase = (songTimeMs % beatMs) / beatMs;
     // Rhythmic bounce pulse: sharp impact on beat, exponential decay
@@ -371,7 +380,8 @@ export class VisualEngine {
     this.updateSplashes(songTimeMs);
 
     // 6. Synchronized Hishaku Ladle Pour Animation
-    // The ladle tilts to pour at the EXACT millisecond the droplet launches (2 beats before hit)
+    // The ladle tilts to pour at the EXACT millisecond the droplet launches
+    // (approachBeats before the hit — 1.5 beats / 1000 ms at 90 BPM)
     if (this.ladleSprite) {
       const approachTimeMs = this.getApproachTimeMs();
       let targetTilt = 0;
@@ -408,8 +418,9 @@ export class VisualEngine {
   }
 
   /**
-   * Interpolates flying tea droplets based purely on exact song time
-   * Each droplet travels for EXACTLY 2 beats (923.08 ms at 130 BPM)
+   * Interpolates flying tea droplets based purely on exact song time.
+   * Each droplet travels for exactly approachBeats (1.5 beats = 1000 ms
+   * at 90 BPM — readable at this tempo, unlike the old 2-beat flight).
    */
   private updateNotes(songTimeMs: number, isPlaying: boolean): void {
     const approachTimeMs = this.getApproachTimeMs();

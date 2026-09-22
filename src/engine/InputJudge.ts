@@ -21,7 +21,7 @@ export interface JudgeResult {
  *   deterministic (each tap consumes at most one note);
  * - among eligible notes within maxHitMs, the smallest |delta| wins;
  * - exact ties resolve to the earliest note (stable, documented).
- *   With eighth-note spacing (~231ms at 130 BPM) a tap can be within
+ *   With eighth-note spacing (~333ms at 90 BPM) a tap can be within
  *   range of at most two neighbours; a late tap on note A resolves A
  *   only if A is strictly closer than B.
  *

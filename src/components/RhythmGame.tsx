@@ -5,7 +5,7 @@ import { InputJudge, JudgeResult } from '../engine/InputJudge';
 import { VisualEngine } from '../engine/VisualEngine';
 import { TIMING_WINDOWS } from '../engine/timing';
 import { ChartEvent, GameScore } from '../types';
-import { ZEN_CHART_METADATA, getFreshChartEvents } from '../data/zenChart';
+import { ZEN_CHART_METADATA, getFreshChartEvents, getLastEventTimeMs } from '../data/zenChart';
 import { TMAService } from '../services/tma';
 
 type GameState = 'IDLE' | 'PLAYING' | 'PAUSED' | 'FINISHED';
@@ -74,12 +74,20 @@ export const RhythmGame: React.FC = () => {
     }
   }, []);
 
-  /** Effective round length: real buffer duration when available, else chart. */
+  /** Effective round length: real buffer duration, but gameplay ends with a
+   * short ring-out tail after the final note (the Rhodes outro keeps playing
+   * only briefly under the results — no 15 s dead wait, no hard cut). */
   const getEffectiveDurationMs = useCallback((): number => {
     const audio = audioEngineRef.current;
     if (audio && !audio.isTrackLooped()) {
       const bufMs = audio.getTrackDurationMs();
-      if (Number.isFinite(bufMs) && bufMs > 0) return bufMs;
+      const lastNoteMs = getLastEventTimeMs(eventsRef.current);
+      const musicEndMs =
+        Number.isFinite(bufMs) && bufMs > 0 ? bufMs : ZEN_CHART_METADATA.songLengthMs;
+      if (lastNoteMs > 0) {
+        return Math.min(musicEndMs, lastNoteMs + 3000);
+      }
+      return musicEndMs;
     }
     return ZEN_CHART_METADATA.songLengthMs;
   }, []);
@@ -195,6 +203,7 @@ export const RhythmGame: React.FC = () => {
       const freshEvents = getFreshChartEvents();
       setChartEvents(freshEvents);
       visual.setBpm(ZEN_CHART_METADATA.bpm);
+      visual.setApproachBeats(ZEN_CHART_METADATA.approachBeats);
       visual.setChartEvents(freshEvents);
       visual.resetScene();
 
@@ -204,14 +213,15 @@ export const RhythmGame: React.FC = () => {
       setSongProgress(0);
 
       // Resolve the genuine active track:
-      // 1) uploaded custom audio when present, 2) pre-rendered default asset
+      // 1) uploaded custom audio when present, 2) pre-rendered 90 BPM master
       // (async), 3) tiny looped dev guide when the asset is absent.
-      // Chart compatibility limit: the chart stays fixed 130 BPM / ~160 s —
-      // custom audio is NOT re-mapped and there is no BPM detection.
+      // Chart compatibility limit: the chart stays fixed to the 90 BPM
+      // production groove — custom audio is NOT re-mapped and there is no
+      // BPM detection or auto-beatmap generation.
       let trackBuffer: AudioBuffer | null = audio.getCustomBuffer();
       let loop = false;
       if (trackBuffer) {
-        setActiveTrackLabel(`custom: ${audio.getCustomTrackName() ?? 'uploaded track'} (chart stays 130 BPM)`);
+        setActiveTrackLabel(`custom: ${audio.getCustomTrackName() ?? 'uploaded track'} (chart stays 90 BPM)`);
       } else {
         try {
           trackBuffer = await audio.loadDefaultTrack();
@@ -227,6 +237,7 @@ export const RhythmGame: React.FC = () => {
       audio.setMuted(isMuted);
       audio.startTrack(trackBuffer, freshEvents, ZEN_CHART_METADATA.bpm, userOffsetMs, {
         loop,
+        approachBeats: ZEN_CHART_METADATA.approachBeats,
         onEnded: () => finishRound(),
       });
       setGameState('PLAYING');
@@ -293,7 +304,7 @@ export const RhythmGame: React.FC = () => {
       // buffer genuinely becomes the next active gameplay track.
       const bytes = await file.arrayBuffer();
       await audio.setCustomTrackFromBytes(bytes, file.name);
-      setActiveTrackLabel(`custom: ${file.name} (chart stays 130 BPM)`);
+      setActiveTrackLabel(`custom: ${file.name} (chart stays 90 BPM)`);
       await startRound();
     } catch (err) {
       console.error('Failed to load custom audio file:', err);
@@ -639,7 +650,8 @@ export const RhythmGame: React.FC = () => {
             />
             <p className="text-[10px] text-[#8C8375] mt-1.5">
               Загруженный трек действительно становится игровым (без генерации поверх).
-              Ограничение: чарт фиксирован под 130 BPM — авто-битмап и BPM-детект не выполняются.
+              Ограничение: чарт написан под грув 90 BPM — загруженная музыка играет как есть,
+              авто-битмап и BPM-детект не выполняются.
             </p>
             <button
               type="button"

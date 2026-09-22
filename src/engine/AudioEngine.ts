@@ -7,6 +7,11 @@ export interface StartTrackOptions {
   loop?: boolean;
   /** Called exactly once on natural end-of-buffer. Never on manual stop. */
   onEnded?: (() => void) | null;
+  /**
+   * Anticipation in beats — must match the chart's approachBeats so cues
+   * fire exactly at droplet launch. Default 1.5 (1000 ms at 90 BPM).
+   */
+  approachBeats?: number;
 }
 
 export class AudioEngine {
@@ -21,7 +26,8 @@ export class AudioEngine {
   private isPlaying = false;
   private trackBuffer: AudioBuffer | null = null;
   private trackLooped = false;
-  private currentBpm = 130;
+  private currentBpm = 90;
+  private approachBeats = 1.5;
 
   // Volume state (mute preserves levels without recreating the context).
   private masterVolume = 0.85;
@@ -29,9 +35,9 @@ export class AudioEngine {
   private muted = false;
 
   // Custom uploaded track becomes the genuine active track when set.
-  // Chart compatibility limit: the chart is fixed 130 BPM / ~160 s with no
-  // auto-beatmap — a custom track plays as-is and the fixed chart still
-  // drives judgment (documented limitation, no BPM detection in Gauntlet 0).
+  // Chart compatibility limit: the chart is fixed to the 90 BPM production
+  // groove with no auto-beatmap — a custom track plays as-is and the fixed
+  // chart still drives judgment (documented limitation, no BPM detection).
   private customBuffer: AudioBuffer | null = null;
   private customName: string | null = null;
 
@@ -253,7 +259,7 @@ export class AudioEngine {
   public startTrack(
     audioBuffer: AudioBuffer,
     chartData: ChartEvent[],
-    bpm = 130,
+    bpm = 90,
     offsetMs = 0,
     options: StartTrackOptions = {}
   ): void {
@@ -265,6 +271,9 @@ export class AudioEngine {
 
     this.trackBuffer = audioBuffer;
     this.currentBpm = bpm;
+    if (options.approachBeats !== undefined && Number.isFinite(options.approachBeats)) {
+      this.approachBeats = options.approachBeats;
+    }
     // offsetMs is input calibration (judgment only) — never shifts the
     // audio timeline itself. Kept as a parameter for backwards compat.
     this.clock.setInputOffsetMs(offsetMs);
@@ -343,9 +352,11 @@ export class AudioEngine {
   }
 
   /**
-   * Schedules audio cues (anticipation wooden clack) with lookahead window
-   * Cues fire when the droplet detaches from the bamboo ladle (2 beats
-   * prior to target). Timing is audio-clock synchronized.
+   * Schedules audio cues (quiet wooden anticipation tick) with a lookahead
+   * window. Cues fire ONLY for notes flagged `cue` (tutorial + selected
+   * pattern openings) — the real drum groove carries all other timing, so
+   * the woodblock never competes with the music. Cue time = droplet launch
+   * (approachBeats before target). Timing is audio-clock synchronized.
    */
   private startLookaheadScheduler(chartData: ChartEvent[]): void {
     const SCHEDULE_INTERVAL_MS = 25;
@@ -356,14 +367,15 @@ export class AudioEngine {
 
       const currentCtxTime = this.audioCtx.currentTime;
       const beatDuration = 60 / this.currentBpm;
-      const approachTimeSec = beatDuration * 2; // Exactly 2 beats approach time
+      const approachTimeSec = beatDuration * this.approachBeats;
 
       chartData.forEach((note) => {
         if (note.status !== 'pending') return;
+        if (note.cue !== true) return;
         // Cue scheduling uses the raw audio timeline (no input calibration).
         const noteAudioTime = this.trackStartTime + note.timeMs / 1000;
 
-        // Launch cue exactly when droplet leaves the bamboo hishaku (2 beats before target hit)
+        // Launch cue exactly when the droplet leaves the bamboo hishaku.
         const cueTime = noteAudioTime - approachTimeSec;
         const cueKey = `cue_${note.id}`;
 
@@ -390,7 +402,8 @@ export class AudioEngine {
     osc.frequency.setValueAtTime(760, targetTime);
     osc.frequency.exponentialRampToValueAtTime(320, targetTime + 0.04);
 
-    gain.gain.setValueAtTime(0.65, targetTime);
+    // Quiet on purpose: the real groove leads, the cue only orients.
+    gain.gain.setValueAtTime(0.45, targetTime);
     gain.gain.exponentialRampToValueAtTime(0.001, targetTime + 0.05);
 
     osc.connect(gain);
@@ -405,7 +418,7 @@ export class AudioEngine {
     clickOsc.type = 'triangle';
     clickOsc.frequency.setValueAtTime(2400, targetTime);
     clickOsc.frequency.exponentialRampToValueAtTime(1100, targetTime + 0.015);
-    clickGain.gain.setValueAtTime(0.42, targetTime);
+    clickGain.gain.setValueAtTime(0.3, targetTime);
     clickGain.gain.exponentialRampToValueAtTime(0.001, targetTime + 0.02);
 
     clickOsc.connect(clickGain);
@@ -420,7 +433,7 @@ export class AudioEngine {
     dropOsc.type = 'sine';
     dropOsc.frequency.setValueAtTime(1450, targetTime);
     dropOsc.frequency.exponentialRampToValueAtTime(2200, targetTime + 0.03);
-    dropGain.gain.setValueAtTime(0.3, targetTime);
+    dropGain.gain.setValueAtTime(0.22, targetTime);
     dropGain.gain.exponentialRampToValueAtTime(0.001, targetTime + 0.038);
 
     dropOsc.connect(dropGain);
@@ -529,7 +542,7 @@ export class AudioEngine {
    * when the pre-rendered default asset is unavailable. Fast (<50 ms),
    * looped, and clearly badged in the UI — not a substitute for the mix.
    */
-  public generateDevGuideLoop(bpm = 130): AudioBuffer {
+  public generateDevGuideLoop(bpm = 90): AudioBuffer {
     if (!this.audioCtx) {
       const AudioCtxClass =
         window.AudioContext ||
@@ -565,7 +578,7 @@ export class AudioEngine {
    * WebViews on mobile). Production uses loadDefaultTrack() (async asset).
    * Retained for offline sound-design iteration and short previews only.
    */
-  public generateZenSoundtrack(bpm = 130, totalSeconds = 160): AudioBuffer {
+  public generateZenSoundtrack(bpm = 90, totalSeconds = 160): AudioBuffer {
     if (totalSeconds > 30 && typeof console !== 'undefined') {
       console.warn(
         `[AudioEngine] generateZenSoundtrack(${bpm}, ${totalSeconds}s) is DEV-ONLY: ` +
@@ -587,7 +600,7 @@ export class AudioEngine {
     const left = buffer.getChannelData(0);
     const right = buffer.getChannelData(1);
 
-    const beatSec = 60 / bpm; // ~0.4615s at 130 BPM
+    const beatSec = 60 / bpm; // ~0.6667s at the 90 BPM dev default
     const totalBeats = Math.floor(totalSeconds / beatSec);
 
     // E minor pentatonic / Japanese Insen pitches
@@ -605,7 +618,7 @@ export class AudioEngine {
       right[i] = -noise + atmosphericDrone;
     }
 
-    // 2. Synthesize each beat in the 130 BPM grid
+    // 2. Synthesize each beat in the dev BPM grid
     for (let beat = 0; beat < totalBeats; beat++) {
       const beatTime = beat * beatSec;
       const beatStartSample = Math.floor(beatTime * sampleRate);

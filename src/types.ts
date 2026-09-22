@@ -21,6 +21,13 @@ export interface ChartNoteDefinition {
   readonly id: string;
   readonly timeMs: number;
   readonly type: 'tap';
+  /**
+   * When true, the engine plays a quiet wooden anticipation cue ahead of
+   * this note (approach window). Default false: the real drum groove
+   * carries the timing; cues are reserved for the tutorial and selected
+   * pattern openings so they never compete with the music.
+   */
+  readonly cue?: boolean;
 }
 
 /**
@@ -48,6 +55,15 @@ export interface ChartMetadata {
   totalMeasures: number;
   beatsPerMeasure: number;
   songLengthMs: number;
+  /** Audio-clock time of grid beat 0 in ms (beat-grid phase). */
+  firstBeatOffsetMs: number;
+  /**
+   * Visual/cue anticipation in beats. Droplets launch this many beats
+   * before their target; woodblock cues fire at launch. Musically
+   * sensible values are 1–1.5 at ~90 BPM (not the old 2-beat default,
+   * which feels painfully slow at 666 ms/beat).
+   */
+  approachBeats: number;
 }
 
 export interface GameScore {
