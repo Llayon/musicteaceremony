@@ -136,7 +136,10 @@ function authorChart(): ChartNoteDefinition[] {
   events.push(...buildBar(29, [1, 2, 3, 4]));
   events.push(...buildBar(30, [1, 3]));
   events.push(...buildBar(31, [1, 3]));
-  events.push(...buildBar(32, [1, 2, 3, { b: 3, sub: 0.5 }, 4])); // build 92–96 s
+  events.push(...buildBar(32, [1, 2, { b: 3, sub: 0.5 }, 4])); // build 92–96 s:
+  // beat 3 is a real rest in the groove (drums drop to novelty floor there)
+  // before the strong 8th pickup — tapping silence would be wrong, so the
+  // rest is kept as musical tension, not a note.
   events.push(...buildBar(33, [1]));
   // Pushed snare: answers the real hit at 95 968 ms, not the empty grid
   // beat at 96 040 ms (no drum transient there; strongest nearby is −72 ms).

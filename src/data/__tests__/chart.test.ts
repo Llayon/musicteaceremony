@@ -97,6 +97,15 @@ describe('chart event integrity', () => {
     expect(ZEN_CHART_EVENTS.find((e) => e.id === 'b33_1')?.timeMs).toBe(95373);
     expect(ZEN_CHART_EVENTS.find((e) => e.id === 'b33_3')?.timeMs).toBe(96707);
   });
+
+  it('keeps the real groove rest in bar 32 (no tap on silence)', () => {
+    // Beat 3 of bar 32 (94 040 ms) is an actual rest: drums drop to the
+    // novelty floor there while neighbours hit 145+ — verified against the
+    // drums stem. The bar answers b1, b2, the strong 8th pickup, b4.
+    expect(ZEN_CHART_EVENTS.some((e) => e.timeMs === 94040)).toBe(false);
+    const bar32 = ZEN_CHART_EVENTS.filter((e) => e.id.startsWith('b32_')).map((e) => e.timeMs);
+    expect(bar32).toEqual([92707, 93373, 94373, 94707]);
+  });
 });
 
 describe('chart runtime isolation', () => {
