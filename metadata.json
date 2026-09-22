@@ -1,0 +1,6 @@
+{
+  "name": "Zen Tea Ceremony - Rhythm Engine",
+  "description": "Rhythm Heaven-style rhythm game engine for Telegram Mini Apps built with Pixi.js v8 and Web Audio API with sub-millisecond precision.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
