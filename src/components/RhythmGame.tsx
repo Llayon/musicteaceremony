@@ -39,6 +39,11 @@ export const RhythmGame: React.FC = () => {
   const [showSettings, setShowSettings] = useState<boolean>(false);
   const [isTmaActive, setIsTmaActive] = useState<boolean>(false);
   const [isMuted, setIsMuted] = useState<boolean>(false);
+  // Custom-upload progress (reading a big phone file + mobile decode can
+  // take tens of seconds with zero feedback otherwise).
+  const [uploadStatus, setUploadStatus] = useState<string | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const [isUploading, setIsUploading] = useState<boolean>(false);
   // Song progress bypasses React state: written straight to the DOM node
   // every frame so PLAYING re-renders only on game events (taps/misses).
   // Pixi stays the sole 60 FPS renderer.
@@ -321,22 +326,93 @@ export const RhythmGame: React.FC = () => {
     // combo, haptic, or visual change. See InputJudge docs.
   };
 
+  /**
+   * Reads a user-picked file with real progress. `file.arrayBuffer()` gives
+   * zero feedback and holds the whole file in RAM at once — on a phone with
+   * a tens-of-MB recording that looks like a hang. Streams chunks instead.
+   */
+  const readFileWithProgress = async (
+    file: File,
+    onProgress: (fraction: number) => void
+  ): Promise<ArrayBuffer> => {
+    const stream = (file as File & { stream?: () => ReadableStream<Uint8Array> }).stream;
+    if (typeof stream !== 'function' || !file.size) {
+      const bytes = await file.arrayBuffer();
+      onProgress(1);
+      return bytes;
+    }
+    const reader = stream.call(file).getReader();
+    const chunks: Uint8Array[] = [];
+    let received = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        chunks.push(value);
+        received += value.byteLength;
+        onProgress(Math.min(1, received / file.size));
+      }
+    }
+    const merged = new Uint8Array(received);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return merged.buffer as ArrayBuffer;
+  };
+
   const handleAudioUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     const audio = audioEngineRef.current;
-    if (!file || !audio) return;
+    if (!file || !audio || isUploading) return;
 
+    setIsUploading(true);
+    setAudioError(null);
     try {
       // Decode directly from bytes (no object URL to leak). The uploaded
       // buffer genuinely becomes the next active gameplay track.
-      const bytes = await file.arrayBuffer();
+      const sizeMb = file.size / (1024 * 1024);
+      if (sizeMb > 25) {
+        setUploadStatus(
+          `Большой файл (${sizeMb.toFixed(0)} МБ) — чтение и декодирование на телефоне могут занять минуту…`
+        );
+      } else {
+        setUploadStatus('Читаем файл…');
+      }
+      setUploadProgress(0);
+      const bytes = await readFileWithProgress(file, (f) => {
+        setUploadProgress(f);
+        setUploadStatus(`Читаем файл… ${Math.round(f * 100)}%`);
+      });
+      // decodeAudioData has no progress API and a multi-minute track can
+      // keep a phone CPU busy for 10–60 s — show the stage explicitly.
+      setUploadStatus('Декодируем аудио… это самая долгая часть на телефоне');
+      setUploadProgress(null);
       await audio.setCustomTrackFromBytes(bytes, file.name);
+      const decodedSec = audio.getCustomBuffer()?.duration ?? 0;
+      if (decodedSec > 600) {
+        setAudioError(
+          `Трек очень длинный (${Math.round(decodedSec / 60)} мин) — играть будет, но чарт рассчитан на ~2:39.`
+        );
+      }
+      setUploadStatus('Готово — запускаем…');
       setActiveTrackLabel(`custom: ${file.name} (chart stays 90 BPM)`);
       await startRound();
+      setUploadStatus(null);
     } catch (err) {
       console.error('Failed to load custom audio file:', err);
-      setAudioError(err instanceof Error ? err.message : 'Failed to decode uploaded audio');
+      const msg =
+        err instanceof DOMException && err.name === 'EncodingError'
+          ? 'Не удалось декодировать файл (возможно, не хватило памяти телефона — попробуйте файл поменьше).'
+          : err instanceof Error
+            ? err.message
+            : 'Failed to decode uploaded audio';
+      setAudioError(msg);
+      setUploadStatus('Ошибка — попробуйте другой файл');
     } finally {
+      setIsUploading(false);
+      setUploadProgress(null);
       e.target.value = '';
     }
   };
@@ -673,14 +749,33 @@ export const RhythmGame: React.FC = () => {
               id="custom-audio-input"
               type="file"
               accept="audio/*"
+              disabled={isUploading}
               onChange={handleAudioUpload}
-              className="text-xs text-[#A69E92] file:mr-2 file:py-1 file:px-2.5 file:rounded-md file:border-0 file:text-xs file:font-semibold file:bg-[#362C23] file:text-[#C4B9A7] hover:file:bg-[#45392D]"
+              className="text-xs text-[#A69E92] file:mr-2 file:py-1 file:px-2.5 file:rounded-md file:border-0 file:text-xs file:font-semibold file:bg-[#362C23] file:text-[#C4B9A7] hover:file:bg-[#45392D] disabled:opacity-60"
             />
+            {(uploadStatus || uploadProgress !== null) && (
+              <div className="mt-1.5">
+                {uploadStatus && (
+                  <p className="text-[11px] font-mono text-[#FCE786] animate-pulse">{uploadStatus}</p>
+                )}
+                {uploadProgress !== null && (
+                  <div className="mt-1 w-full h-1 bg-[#2C2723] rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-[#4DA2FF]"
+                      style={{ width: `${Math.round(uploadProgress * 100)}%` }}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
             <p className="text-[10px] text-[#8C8375] mt-1.5">
               Загруженный трек действительно становится игровым (без генерации поверх).
               Ограничение: чарт написан под грув 90 BPM — загруженная музыка играет как есть,
               авто-битмап и BPM-детект не выполняются.
             </p>
+            {audioError && (
+              <p className="mt-1.5 text-[11px] text-red-400">{audioError}</p>
+            )}
             <button
               type="button"
               onClick={handleClearCustomTrack}
