@@ -1,4 +1,13 @@
-import { ChartEvent } from '../types';
+import type { ChartEvent } from '../types';
+import { TimingClock } from './TimingClock';
+import { DEFAULT_TRACK_URL } from './defaultTrack';
+
+export interface StartTrackOptions {
+  /** Loop the buffer (used for the dev guide-loop fallback). Default false. */
+  loop?: boolean;
+  /** Called exactly once on natural end-of-buffer. Never on manual stop. */
+  onEnded?: (() => void) | null;
+}
 
 export class AudioEngine {
   private audioCtx: AudioContext | null = null;
@@ -6,28 +15,38 @@ export class AudioEngine {
   private masterGain: GainNode | null = null;
   private sfxGain: GainNode | null = null;
 
-  // Multi-stem gain nodes
-  private stemGains: {
-    drums: GainNode | null;
-    bass: GainNode | null;
-    chords: GainNode | null;
-    lead: GainNode | null;
-  } = {
-    drums: null,
-    bass: null,
-    chords: null,
-    lead: null,
-  };
+  private readonly clock = new TimingClock();
 
-  private trackStartTime: number = 0;
-  private isPlaying: boolean = false;
+  private trackStartTime = 0;
+  private isPlaying = false;
   private trackBuffer: AudioBuffer | null = null;
-  private currentBpm: number = 130;
-  private offsetMs: number = 0;
+  private trackLooped = false;
+  private currentBpm = 130;
+
+  // Volume state (mute preserves levels without recreating the context).
+  private masterVolume = 0.85;
+  private sfxVolume = 1.0;
+  private muted = false;
+
+  // Custom uploaded track becomes the genuine active track when set.
+  // Chart compatibility limit: the chart is fixed 130 BPM / ~160 s with no
+  // auto-beatmap — a custom track plays as-is and the fixed chart still
+  // drives judgment (documented limitation, no BPM detection in Gauntlet 0).
+  private customBuffer: AudioBuffer | null = null;
+  private customName: string | null = null;
+
+  private defaultBuffer: AudioBuffer | null = null;
+  private defaultPromise: Promise<AudioBuffer> | null = null;
+
+  // Lifecycle: suppress the onended callback for manual stops so a manual
+  // stop never produces a duplicate "completed" callback.
+  private suppressEndedEvent = false;
+  private onTrackEnded: (() => void) | null = null;
 
   // Lookahead cue scheduler
   private lookaheadTimerId: number | null = null;
   private scheduledCueIndices = new Set<string>();
+  private disposed = false;
 
   constructor() {
     // Lazily initialized on pointerdown
@@ -44,24 +63,12 @@ export class AudioEngine {
       this.audioCtx = new AudioCtxClass();
 
       this.masterGain = this.audioCtx.createGain();
-      this.masterGain.gain.setValueAtTime(0.85, this.audioCtx.currentTime);
-
       this.sfxGain = this.audioCtx.createGain();
-      this.sfxGain.gain.setValueAtTime(1.0, this.audioCtx.currentTime);
-
-      // Stems
-      this.stemGains.drums = this.audioCtx.createGain();
-      this.stemGains.bass = this.audioCtx.createGain();
-      this.stemGains.chords = this.audioCtx.createGain();
-      this.stemGains.lead = this.audioCtx.createGain();
-
-      this.stemGains.drums.connect(this.masterGain);
-      this.stemGains.bass.connect(this.masterGain);
-      this.stemGains.chords.connect(this.masterGain);
-      this.stemGains.lead.connect(this.masterGain);
+      this.applyGains();
 
       this.masterGain.connect(this.audioCtx.destination);
       this.sfxGain.connect(this.audioCtx.destination);
+      this.clock.attach(this.audioCtx);
     }
 
     if (this.audioCtx.state === 'suspended') {
@@ -71,29 +78,50 @@ export class AudioEngine {
     return this.audioCtx;
   }
 
-  /**
-   * Adjusts volume of SFX and rhythm cues (0 to 1.5)
-   */
-  public setSfxVolume(volume: number): void {
-    if (this.sfxGain && this.audioCtx) {
-      this.sfxGain.gain.setValueAtTime(
-        Math.max(0, Math.min(1.5, volume)),
-        this.audioCtx.currentTime
-      );
+  public getTimingClock(): TimingClock {
+    return this.clock;
+  }
+
+  // ---------------------------------------------------------------- volumes
+
+  private applyGains(): void {
+    if (!this.audioCtx) return;
+    const t = this.audioCtx.currentTime;
+    if (this.masterGain) {
+      this.masterGain.gain.setValueAtTime(this.muted ? 0 : this.masterVolume, t);
+    }
+    if (this.sfxGain) {
+      this.sfxGain.gain.setValueAtTime(this.muted ? 0 : this.sfxVolume, t);
     }
   }
 
   /**
-   * Adjusts volume of specific audio stems (0 to 1)
+   * Real mute: silences track + SFX via gain while the audio clock keeps
+   * running uninterrupted (no context recreation, no chart timing change).
    */
-  public setStemVolume(stem: 'drums' | 'bass' | 'chords' | 'lead', volume: number): void {
-    if (this.stemGains[stem] && this.audioCtx) {
-      this.stemGains[stem]!.gain.setValueAtTime(
-        Math.max(0, Math.min(1, volume)),
-        this.audioCtx.currentTime
-      );
-    }
+  public setMuted(muted: boolean): void {
+    this.muted = muted;
+    this.applyGains();
   }
+
+  public isMuted(): boolean {
+    return this.muted;
+  }
+
+  public setMasterVolume(volume: number): void {
+    this.masterVolume = Math.max(0, Math.min(1.5, volume));
+    this.applyGains();
+  }
+
+  /**
+   * Adjusts volume of SFX and rhythm cues (0 to 1.5)
+   */
+  public setSfxVolume(volume: number): void {
+    this.sfxVolume = Math.max(0, Math.min(1.5, volume));
+    this.applyGains();
+  }
+
+  // ------------------------------------------------------------------ tracks
 
   /**
    * Loads and decodes an audio file via fetch & audioCtx.decodeAudioData
@@ -110,38 +138,124 @@ export class AudioEngine {
     return decodedBuffer;
   }
 
-  public setOffsetMs(offsetMs: number): void {
-    this.offsetMs = offsetMs;
+  /**
+   * Decode user-uploaded audio bytes into the genuine active gameplay track.
+   * Callers must revoke any object URL they created after decoding.
+   */
+  public async setCustomTrackFromBytes(bytes: ArrayBuffer, name?: string): Promise<AudioBuffer> {
+    const ctx = await this.resumeContext();
+    // decodeAudioData detaches/transfers in some browsers — copy for safety.
+    const copy = bytes.slice(0);
+    const decoded = await ctx.decodeAudioData(copy);
+    this.customBuffer = decoded;
+    this.customName = name ?? 'custom track';
+    return decoded;
   }
 
-  public getOffsetMs(): number {
-    return this.offsetMs;
+  public hasCustomTrack(): boolean {
+    return this.customBuffer !== null;
+  }
+
+  public getCustomTrackName(): string | null {
+    return this.customName;
+  }
+
+  public getCustomBuffer(): AudioBuffer | null {
+    return this.customBuffer;
+  }
+
+  public clearCustomTrack(): void {
+    this.customBuffer = null;
+    this.customName = null;
   }
 
   /**
-   * Dual-Clock source of truth:
-   * Returns exact elapsed playback time in milliseconds based purely on AudioContext.currentTime.
+   * Async production path: fetch + decode the pre-rendered default song.
+   * Throws when the asset is missing so callers can fall back explicitly
+   * (dev guide loop) instead of silently synthesizing 160 s on the tap path.
+   */
+  public async loadDefaultTrack(): Promise<AudioBuffer> {
+    if (this.defaultBuffer) return this.defaultBuffer;
+    if (this.defaultPromise) return this.defaultPromise;
+
+    this.defaultPromise = (async () => {
+      const ctx = await this.resumeContext();
+      const response = await fetch(DEFAULT_TRACK_URL);
+      if (!response.ok) {
+        throw new Error(
+          `Default track asset missing at ${DEFAULT_TRACK_URL} ` +
+            `(HTTP ${response.status}). See public/audio/README.md.`
+        );
+      }
+      const arrayBuffer = await response.arrayBuffer();
+      const decoded = await ctx.decodeAudioData(arrayBuffer);
+      this.defaultBuffer = decoded;
+      return decoded;
+    })();
+
+    try {
+      return await this.defaultPromise;
+    } catch (err) {
+      this.defaultPromise = null;
+      throw err;
+    }
+  }
+
+  /** Active buffer duration in ms (0 when no track loaded). Source of truth. */
+  public getTrackDurationMs(): number {
+    if (this.trackBuffer) return this.trackBuffer.duration * 1000;
+    if (this.customBuffer) return this.customBuffer.duration * 1000;
+    if (this.defaultBuffer) return this.defaultBuffer.duration * 1000;
+    return 0;
+  }
+
+  public isTrackLooped(): boolean {
+    return this.trackLooped;
+  }
+
+  // ------------------------------------------------------------------ clock
+
+  /**
+   * Input calibration offset (ms). Judgment-only: subtracted from the
+   * measured tap time before judging (positive => tap counts as earlier).
+   * Never shifts visuals, progress, audio scheduling, or auto-miss timing.
+   * Default 0.
+   */
+  public setOffsetMs(offsetMs: number): void {
+    this.clock.setInputOffsetMs(offsetMs);
+  }
+
+  public getOffsetMs(): number {
+    return this.clock.getInputOffsetMs();
+  }
+
+  /**
+   * Raw song position in ms derived purely from AudioContext.currentTime.
+   * No calibration applied — use for visuals, progress, miss detection.
    */
   public getExactSongTime(): number {
     if (!this.isPlaying || !this.audioCtx) {
       return 0;
     }
-    const elapsedSeconds = this.audioCtx.currentTime - this.trackStartTime;
-    return Math.max(0, elapsedSeconds * 1000 - this.offsetMs);
+    return this.clock.getSongTimeMs();
   }
 
   public getAudioCurrentTime(): number {
     return this.audioCtx ? this.audioCtx.currentTime : 0;
   }
 
+  // ---------------------------------------------------------------- playback
+
   /**
-   * Starts track playback with lookahead scheduling
+   * Starts track playback with lookahead scheduling.
+   * Cleans any previous source/scheduler state first.
    */
   public startTrack(
     audioBuffer: AudioBuffer,
     chartData: ChartEvent[],
-    bpm: number = 130,
-    offsetMs: number = 0
+    bpm = 130,
+    offsetMs = 0,
+    options: StartTrackOptions = {}
   ): void {
     if (!this.audioCtx || !this.masterGain) {
       throw new Error('AudioContext not initialized. Call resumeContext() first.');
@@ -151,19 +265,39 @@ export class AudioEngine {
 
     this.trackBuffer = audioBuffer;
     this.currentBpm = bpm;
-    this.offsetMs = offsetMs;
+    // offsetMs is input calibration (judgment only) — never shifts the
+    // audio timeline itself. Kept as a parameter for backwards compat.
+    this.clock.setInputOffsetMs(offsetMs);
     this.scheduledCueIndices.clear();
+    this.suppressEndedEvent = false;
+    this.onTrackEnded = options.onEnded ?? null;
+    this.trackLooped = options.loop ?? false;
 
     const lookaheadDelaySec = 0.1; // 100ms lookahead start delay
     this.trackStartTime = this.audioCtx.currentTime + lookaheadDelaySec;
+    this.clock.setTrackStartTime(this.trackStartTime);
     this.isPlaying = true;
 
     this.trackSource = this.audioCtx.createBufferSource();
     this.trackSource.buffer = audioBuffer;
+    this.trackSource.loop = this.trackLooped;
     this.trackSource.connect(this.masterGain);
 
     this.trackSource.onended = () => {
-      // Stopped
+      if (this.suppressEndedEvent) {
+        this.suppressEndedEvent = false;
+        return;
+      }
+      // Natural end of buffer: reflect reality, clear scheduler, notify once.
+      this.isPlaying = false;
+      if (this.lookaheadTimerId !== null) {
+        window.clearInterval(this.lookaheadTimerId);
+        this.lookaheadTimerId = null;
+      }
+      this.trackSource = null;
+      const cb = this.onTrackEnded;
+      this.onTrackEnded = null;
+      if (cb) cb();
     };
 
     this.trackSource.start(this.trackStartTime);
@@ -173,7 +307,7 @@ export class AudioEngine {
   }
 
   /**
-   * Stops current playback cleanly
+   * Stops current playback cleanly. Never triggers the natural-end callback.
    */
   public stopTrack(): void {
     if (this.lookaheadTimerId !== null) {
@@ -182,7 +316,9 @@ export class AudioEngine {
     }
 
     if (this.trackSource) {
+      this.suppressEndedEvent = true;
       try {
+        this.trackSource.onended = null;
         this.trackSource.stop();
         this.trackSource.disconnect();
       } catch {
@@ -191,6 +327,7 @@ export class AudioEngine {
       this.trackSource = null;
     }
 
+    this.onTrackEnded = null;
     this.isPlaying = false;
   }
 
@@ -198,9 +335,17 @@ export class AudioEngine {
     return this.isPlaying;
   }
 
+  /** Idempotent cleanup for React StrictMode / unmount. */
+  public dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.stopTrack();
+  }
+
   /**
    * Schedules audio cues (anticipation wooden clack) with lookahead window
-   * Cues fire at the exact sub-millisecond instant the droplet detaches from the bamboo ladle (2 beats prior to target)
+   * Cues fire when the droplet detaches from the bamboo ladle (2 beats
+   * prior to target). Timing is audio-clock synchronized.
    */
   private startLookaheadScheduler(chartData: ChartEvent[]): void {
     const SCHEDULE_INTERVAL_MS = 25;
@@ -214,7 +359,9 @@ export class AudioEngine {
       const approachTimeSec = beatDuration * 2; // Exactly 2 beats approach time
 
       chartData.forEach((note) => {
-        const noteAudioTime = this.trackStartTime + (note.timeMs + this.offsetMs) / 1000;
+        if (note.status !== 'pending') return;
+        // Cue scheduling uses the raw audio timeline (no input calibration).
+        const noteAudioTime = this.trackStartTime + note.timeMs / 1000;
 
         // Launch cue exactly when droplet leaves the bamboo hishaku (2 beats before target hit)
         const cueTime = noteAudioTime - approachTimeSec;
@@ -273,7 +420,7 @@ export class AudioEngine {
     dropOsc.type = 'sine';
     dropOsc.frequency.setValueAtTime(1450, targetTime);
     dropOsc.frequency.exponentialRampToValueAtTime(2200, targetTime + 0.03);
-    dropGain.gain.setValueAtTime(0.30, targetTime);
+    dropGain.gain.setValueAtTime(0.3, targetTime);
     dropGain.gain.exponentialRampToValueAtTime(0.001, targetTime + 0.038);
 
     dropOsc.connect(dropGain);
@@ -301,7 +448,7 @@ export class AudioEngine {
     osc.frequency.exponentialRampToValueAtTime(baseFreq * 1.45, now + 0.04);
     osc.frequency.exponentialRampToValueAtTime(baseFreq * 0.7, now + 0.14);
 
-    gain.gain.setValueAtTime(rating === 'PERFECT' ? 0.75 : 0.60, now);
+    gain.gain.setValueAtTime(rating === 'PERFECT' ? 0.75 : 0.6, now);
     gain.gain.exponentialRampToValueAtTime(0.001, now + 0.18);
 
     osc.connect(gain);
@@ -319,7 +466,7 @@ export class AudioEngine {
     }
     splashNoise.buffer = noiseBuffer;
     const splashGain = ctx.createGain();
-    splashGain.gain.setValueAtTime(0.40, now);
+    splashGain.gain.setValueAtTime(0.4, now);
     splashNoise.connect(splashGain);
     splashGain.connect(this.sfxGain);
     splashNoise.start(now);
@@ -378,18 +525,60 @@ export class AudioEngine {
   }
 
   /**
-   * Synthesizes the 130 BPM 4-Stem Zen Track matching the user's attached music:
-   * Stem 1: Deep Rolling Bass & 808
-   * Stem 2: 130 BPM Breakbeat Drums (Kick, Snare on 2&4, 16th hats, fills)
-   * Stem 3: Japanese Acoustic Koto & Guitar Chords
-   * Stem 4: Zen Bamboo Wind, Bells & Pads
+   * Lightweight dev-only guide loop (~2 bars of metronome clicks) used only
+   * when the pre-rendered default asset is unavailable. Fast (<50 ms),
+   * looped, and clearly badged in the UI — not a substitute for the mix.
    */
-  public generateZenSoundtrack(bpm: number = 130, totalSeconds: number = 160): AudioBuffer {
+  public generateDevGuideLoop(bpm = 130): AudioBuffer {
     if (!this.audioCtx) {
       const AudioCtxClass =
         window.AudioContext ||
         (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       this.audioCtx = new AudioCtxClass();
+      this.clock.attach(this.audioCtx);
+    }
+    const sampleRate = this.audioCtx.sampleRate;
+    const beatSec = 60 / bpm;
+    const totalSec = beatSec * 8; // 2 bars of 4/4
+    const totalSamples = Math.floor(sampleRate * totalSec);
+    const buffer = this.audioCtx.createBuffer(2, totalSamples, sampleRate);
+
+    for (let ch = 0; ch < 2; ch++) {
+      const out = buffer.getChannelData(ch);
+      for (let beat = 0; beat < 8; beat++) {
+        const start = Math.floor(beat * beatSec * sampleRate);
+        const len = Math.floor(sampleRate * 0.05);
+        const freq = beat % 4 === 0 ? 1200 : 800;
+        for (let s = 0; s < len && start + s < totalSamples; s++) {
+          const t = s / sampleRate;
+          out[start + s] += Math.sin(2 * Math.PI * freq * t) * 0.4 * Math.exp(-t * 60);
+        }
+      }
+    }
+    return buffer;
+  }
+
+  /**
+   * DEV-ONLY: full procedural mix. Do NOT call on the player Start path in
+   * production — it synchronously renders minutes of stereo PCM on the main
+   * thread (main-thread stall + large allocation, fatal in Telegram
+   * WebViews on mobile). Production uses loadDefaultTrack() (async asset).
+   * Retained for offline sound-design iteration and short previews only.
+   */
+  public generateZenSoundtrack(bpm = 130, totalSeconds = 160): AudioBuffer {
+    if (totalSeconds > 30 && typeof console !== 'undefined') {
+      console.warn(
+        `[AudioEngine] generateZenSoundtrack(${bpm}, ${totalSeconds}s) is DEV-ONLY: ` +
+          `synchronous long-form synthesis stalls the main thread. ` +
+          `Use loadDefaultTrack() for gameplay.`
+      );
+    }
+    if (!this.audioCtx) {
+      const AudioCtxClass =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      this.audioCtx = new AudioCtxClass();
+      this.clock.attach(this.audioCtx);
     }
 
     const sampleRate = this.audioCtx.sampleRate;
@@ -427,7 +616,7 @@ export class AudioEngine {
       const isBreakdown = bar >= 44 && bar < 52;
       const isIntro = bar < 4;
 
-      // --- STEM 2: DRUMS (Punchy Rhythm Heaven transient definition) ---
+      // --- DRUMS (Punchy transient definition) ---
       if (!isBreakdown && !isIntro) {
         // Kick on Beat 0 and Beat 2 (solid downbeat & backbeat anchors)
         if (beatInBar === 0 || beatInBar === 2) {
@@ -445,7 +634,7 @@ export class AudioEngine {
 
         // Snare on Beat 1 and Beat 3 (crisp crack & presence)
         if (beatInBar === 1 || beatInBar === 3) {
-          const snareLen = Math.floor(sampleRate * 0.20);
+          const snareLen = Math.floor(sampleRate * 0.2);
           for (let s = 0; s < snareLen && beatStartSample + s < totalSamples; s++) {
             const t = s / sampleRate;
             const snap = Math.sin(2 * Math.PI * 2200 * t) * 0.26 * Math.exp(-t * 60);
@@ -472,7 +661,7 @@ export class AudioEngine {
         }
       }
 
-      // --- STEM 1: ROLLING BASS (Active with drums) ---
+      // --- ROLLING BASS (Active with drums) ---
       if (!isBreakdown && !isIntro) {
         const bassPitch = bassPitches[(bar * 2 + beatInBar) % bassPitches.length];
         const bassLen = Math.floor(sampleRate * 0.4);
@@ -488,7 +677,7 @@ export class AudioEngine {
         }
       }
 
-      // --- STEM 3: KOTO / GUITAR ARPEGGIOS ---
+      // --- KOTO / GUITAR ARPEGGIOS ---
       if (beat % 2 === 0 || isBreakdown) {
         const pitch = kotoPitches[(beat * 3) % kotoPitches.length];
         const pluckLen = Math.floor(sampleRate * 0.7);
@@ -505,7 +694,7 @@ export class AudioEngine {
         }
       }
 
-      // --- STEM 4: RHYTHM GUIDE & BAMBOO BEAT PULSE ---
+      // --- RHYTHM GUIDE & BAMBOO BEAT PULSE ---
       // Authentic bamboo woodblock count-in during Intro (bars 0-3) and Breakdown
       if (isIntro || isBreakdown) {
         const countLen = Math.floor(sampleRate * 0.05);

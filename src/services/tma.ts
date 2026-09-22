@@ -1,6 +1,12 @@
 /**
  * Telegram Mini Apps (TMA) Integration Service
- * Provides safe HapticFeedback, viewport expand, and safe area helpers
+ * Provides safe HapticFeedback, viewport expand, and safe area helpers.
+ *
+ * Haptics are cosmetic feedback only — never a timing source. All calls are
+ * fire-and-forget with failure isolation (gameplay never breaks when TMA is
+ * absent or throws), and per-note idempotency is guaranteed upstream by
+ * InputJudge (a note resolves exactly once, so haptics never repeat for the
+ * same note). The navigator.vibrate fallback stays optional and best-effort.
  */
 
 // Define Telegram WebApp types

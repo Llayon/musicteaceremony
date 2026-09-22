@@ -1,20 +1,44 @@
 /**
  * Rhythm Game Core Types & Chart Specifications
- * Designed for Telegram Mini Apps with sub-millisecond precision
+ * Timing is audio-clock synchronized (AudioContext.currentTime is the
+ * authoritative gameplay timeline). See engine/TimingClock.ts.
  */
 
+/** Hit judgment for a consumed note. */
 export type HitRating = 'PERFECT' | 'GOOD' | 'MISS';
 
-export interface ChartEvent {
-  id: string;
-  timeMs: number;
-  type: 'tap' | 'hold';
+/**
+ * Immutable chart source data. Chart definitions must never be mutated at
+ * runtime — use `getFreshChartEvents()` / `createRuntimeNotes()` to obtain
+ * fresh mutable copies per round.
+ *
+ * NOTE (Gauntlet 0): only `tap` notes are supported. `hold` is intentionally
+ * absent from the public type until hold gameplay is implemented. If chart
+ * data ever contains an unknown type at runtime it must be rejected safely
+ * by the judge (see InputJudge).
+ */
+export interface ChartNoteDefinition {
+  readonly id: string;
+  readonly timeMs: number;
+  readonly type: 'tap';
+}
+
+/**
+ * Mutable per-round runtime state. Created fresh for every round from
+ * {@link ChartNoteDefinition}.
+ */
+export interface RuntimeChartNote extends ChartNoteDefinition {
   status: 'pending' | 'hit' | 'miss';
   rating?: HitRating;
   hitDeltaMs?: number;
-  // Hold note duration if type === 'hold'
-  durationMs?: number;
 }
+
+/**
+ * Backwards-compatible alias. Historically `ChartEvent` mixed immutable
+ * chart data with mutable runtime fields; new code should prefer the
+ * explicit `ChartNoteDefinition` / `RuntimeChartNote` split.
+ */
+export type ChartEvent = RuntimeChartNote;
 
 export interface ChartMetadata {
   title: string;

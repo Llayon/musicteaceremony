@@ -10,6 +10,7 @@ import {
 import { ChartEvent, HitRating } from '../types';
 import { SPRITESHEET_MANIFEST, generateSpritesheetCanvas } from '../assets/spritesheet';
 import { AudioEngine } from './AudioEngine';
+import { TIMING_WINDOWS } from './timing';
 
 interface PooledNote {
   sprite: Sprite;
@@ -86,6 +87,8 @@ export class VisualEngine {
   private activeEvents: ChartEvent[] = [];
   private cupReactionResetTime: number = 0;
   private teaFillLevel: number = 0; // 0 to 1
+  private destroyed = false;
+  private ringResetTimer: number | null = null;
 
   constructor(audioEngine: AudioEngine) {
     this.audioEngine = audioEngine;
@@ -95,6 +98,7 @@ export class VisualEngine {
    * Initializes Pixi.js v8 Application with 9:16 orientation & scaleMode nearest
    */
   public async init(containerElement: HTMLDivElement): Promise<void> {
+    if (this.destroyed) return;
     this.container = containerElement;
 
     // 1. Create Pixi.js v8 Application
@@ -418,7 +422,9 @@ export class VisualEngine {
         if (note.status !== 'pending') continue;
 
         const startTime = note.timeMs - approachTimeMs;
-        const endTime = note.timeMs + 100; // Aligned with InputJudge.GOOD_WINDOW_MS
+        // Keep the droplet visible until the GOOD window closes so visuals
+        // agree with the judge's auto-miss timing (single source of truth).
+        const endTime = note.timeMs + TIMING_WINDOWS.goodMs;
 
         if (songTimeMs >= startTime && songTimeMs <= endTime) {
           visibleNotes.push(note);
@@ -595,8 +601,12 @@ export class VisualEngine {
         .ellipse(this.targetX, this.targetY, 32, 10)
         .stroke({ width: 3, color: ringColor, alpha: 0.9 });
 
-      setTimeout(() => {
-        if (this.targetRing) {
+      if (this.ringResetTimer !== null) {
+        window.clearTimeout(this.ringResetTimer);
+      }
+      this.ringResetTimer = window.setTimeout(() => {
+        this.ringResetTimer = null;
+        if (this.targetRing && !this.destroyed) {
           this.targetRing.clear();
           this.targetRing
             .ellipse(this.targetX, this.targetY, 26, 8)
@@ -660,12 +670,27 @@ export class VisualEngine {
   }
 
   /**
-   * Clean destruction
+   * Clean destruction (idempotent — safe under React StrictMode remounts).
    */
   public destroy(): void {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    if (this.ringResetTimer !== null) {
+      window.clearTimeout(this.ringResetTimer);
+      this.ringResetTimer = null;
+    }
     if (this.app) {
       this.app.destroy(true, { children: true });
       this.app = null;
     }
+    this.stageContainer = null;
+    this.backgroundLayer = null;
+    this.gameLayer = null;
+    this.feedbackLayer = null;
+    this.textures.clear();
+    this.notePool = [];
+    this.feedbackPool = [];
+    this.splashPool = [];
+    this.activeEvents = [];
   }
 }

@@ -1,5 +1,6 @@
-import { ChartEvent, HitRating, GameScore } from '../types';
+import type { ChartEvent, HitRating, GameScore } from '../types';
 import { TMAService } from '../services/tma';
+import { TIMING_WINDOWS, classifyDelta, isPastMissTimeout } from './timing';
 
 export interface JudgeResult {
   rating: HitRating;
@@ -9,12 +10,37 @@ export interface JudgeResult {
   isMissedTimeout?: boolean;
 }
 
+/**
+ * InputJudge — deterministic tap judgment against runtime chart notes.
+ *
+ * Timing windows: see TIMING_WINDOWS (single source of truth).
+ *
+ * Candidate selection (note-stealing prevention):
+ * - only `pending` notes are eligible; resolved notes can never be
+ *   re-scored, so duplicate taps cannot score twice and rapid taps are
+ *   deterministic (each tap consumes at most one note);
+ * - among eligible notes within maxHitMs, the smallest |delta| wins;
+ * - exact ties resolve to the earliest note (stable, documented).
+ *   With eighth-note spacing (~231ms at 130 BPM) a tap can be within
+ *   range of at most two neighbours; a late tap on note A resolves A
+ *   only if A is strictly closer than B.
+ *
+ * Ghost-tap policy (deliberate, not accidental):
+ * - a tap with no pending candidate within maxHitMs is a NEUTRAL ghost:
+ *   handlePointerDown returns null, score/combo are untouched, no haptic
+ *   fires. This keeps casual screen touches forgiving on mobile.
+ * - a tap within maxHitMs but outside the GOOD window DOES consume the
+ *   note as MISS (breaking combo). Near-miss spam is therefore punished
+ *   while far spam stays neutral.
+ *
+ * Hold notes: unsupported in Gauntlet 0. Notes whose runtime `type` is
+ * not 'tap' are skipped safely (never consumed, never crash).
+ */
 export class InputJudge {
-  // Timing windows in milliseconds: tuned for crisp mobile touch responsiveness (±50ms PERFECT, ±100ms GOOD)
-  public static readonly PERFECT_WINDOW_MS = 50;
-  public static readonly GOOD_WINDOW_MS = 100;
-  // Maximum search window to consider a tap targeted at a note (tightened to prevent stealing in 8th-note cascades)
-  public static readonly MAX_HIT_WINDOW_MS = 120;
+  /** Backwards-compatible aliases — always mirror TIMING_WINDOWS. */
+  public static readonly PERFECT_WINDOW_MS = TIMING_WINDOWS.perfectMs;
+  public static readonly GOOD_WINDOW_MS = TIMING_WINDOWS.goodMs;
+  public static readonly MAX_HIT_WINDOW_MS = TIMING_WINDOWS.maxHitMs;
 
   private scoreState: GameScore = {
     score: 0,
@@ -51,11 +77,17 @@ export class InputJudge {
   }
 
   /**
-   * Validates a global pointerdown tap against the chart
-   * Uses exactSongTimeMs derived purely from AudioContext.currentTime
+   * Validates a tap against the chart.
+   * @param judgmentSongTimeMs tap position on the song timeline in ms
+   *   (already calibrated — caller maps PointerEvent.timeStamp through
+   *   TimingClock.inputToSongTimeMs; see RhythmGame).
+   * @returns JudgeResult for a consumed note, or null for a neutral
+   *   ghost tap (intentional no-op — see class docs).
    */
-  public handlePointerDown(exactSongTimeMs: number, events: ChartEvent[]): JudgeResult | null {
-    // Find the closest pending note within the search window
+  public handlePointerDown(judgmentSongTimeMs: number, events: ChartEvent[]): JudgeResult | null {
+    // Find the closest pending, supported note within the search window.
+    // Tie-break: earliest note wins (deterministic for simultaneous
+    // candidates, e.g. a tap exactly midway between eighth notes).
     let candidate: ChartEvent | null = null;
     let minAbsDelta = Infinity;
     let candidateDelta = 0;
@@ -63,33 +95,38 @@ export class InputJudge {
     for (let i = 0; i < events.length; i++) {
       const note = events[i];
       if (note.status !== 'pending') continue;
+      if ((note.type as string) !== 'tap') continue; // hold/unknown: reject safely
 
       // Delta: positive means player is late, negative means player is early
-      const delta = exactSongTimeMs - note.timeMs;
+      const delta = judgmentSongTimeMs - note.timeMs;
       const absDelta = Math.abs(delta);
 
-      if (absDelta < minAbsDelta && absDelta <= InputJudge.MAX_HIT_WINDOW_MS) {
-        minAbsDelta = absDelta;
-        candidateDelta = delta;
-        candidate = note;
+      if (absDelta <= TIMING_WINDOWS.maxHitMs) {
+        if (
+          absDelta < minAbsDelta ||
+          (absDelta === minAbsDelta && candidate !== null && note.timeMs < candidate.timeMs)
+        ) {
+          minAbsDelta = absDelta;
+          candidateDelta = delta;
+          candidate = note;
+        }
       }
     }
 
     if (!candidate) {
-      // Empty tap without a note nearby - optional blank swing
+      // Intentional neutral ghost tap: no nearby note, no score change.
       return null;
     }
 
-    // Determine rating based on strict sub-millisecond thresholds
-    let rating: HitRating;
-    if (minAbsDelta <= InputJudge.PERFECT_WINDOW_MS) {
-      rating = 'PERFECT';
+    // classifyDelta returns null only outside maxHitMs, which cannot happen
+    // here (candidate is within window) — the MISS branch below covers the
+    // 101..120ms ring, which consumes the note as a miss.
+    const rating: HitRating = classifyDelta(minAbsDelta) ?? 'MISS';
+    if (rating === 'PERFECT') {
       TMAService.hapticImpact('light');
-    } else if (minAbsDelta <= InputJudge.GOOD_WINDOW_MS) {
-      rating = 'GOOD';
+    } else if (rating === 'GOOD') {
       TMAService.hapticImpact('soft');
     } else {
-      rating = 'MISS';
       TMAService.hapticNotification('warning');
     }
 
@@ -109,20 +146,23 @@ export class InputJudge {
   }
 
   /**
-   * Evaluates pending notes that passed the GOOD threshold without being tapped
+   * Evaluates pending notes that passed the GOOD threshold without being tapped.
+   * A note survives exactly until songTime > note.timeMs + goodMs, then
+   * resolves as MISS exactly once (status guard prevents repeats, so
+   * haptics never fire repeatedly for the same note).
    */
-  public checkMissedNotes(exactSongTimeMs: number, events: ChartEvent[]): JudgeResult[] {
+  public checkMissedNotes(songTimeMs: number, events: ChartEvent[]): JudgeResult[] {
     const missedResults: JudgeResult[] = [];
 
     for (let i = 0; i < events.length; i++) {
       const note = events[i];
       if (note.status !== 'pending') continue;
+      if ((note.type as string) !== 'tap') continue;
 
-      // If the note target time has passed by more than the GOOD window (+90ms), it's a MISS
-      if (exactSongTimeMs > note.timeMs + InputJudge.GOOD_WINDOW_MS) {
+      if (isPastMissTimeout(songTimeMs, note.timeMs)) {
         note.status = 'miss';
         note.rating = 'MISS';
-        note.hitDeltaMs = exactSongTimeMs - note.timeMs;
+        note.hitDeltaMs = songTimeMs - note.timeMs;
 
         TMAService.hapticNotification('warning');
         this.applyRatingToScore('MISS');

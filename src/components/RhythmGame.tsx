@@ -3,6 +3,7 @@ import { Volume2, VolumeX, RotateCcw, Play, Award, Zap, Sliders, Music, Sparkles
 import { AudioEngine } from '../engine/AudioEngine';
 import { InputJudge, JudgeResult } from '../engine/InputJudge';
 import { VisualEngine } from '../engine/VisualEngine';
+import { TIMING_WINDOWS } from '../engine/timing';
 import { ChartEvent, GameScore } from '../types';
 import { ZEN_CHART_METADATA, getFreshChartEvents } from '../data/zenChart';
 import { TMAService } from '../services/tma';
@@ -30,24 +31,17 @@ export const RhythmGame: React.FC = () => {
   });
 
   const [lastDelta, setLastDelta] = useState<{ delta: number; rating: string } | null>(null);
+  // Input calibration (ms). Judgment-only: positive makes a tap count as
+  // earlier (Bluetooth/output-delay compensation). Never shifts visuals,
+  // audio scheduling, or auto-miss timing. Default 0.
   const [userOffsetMs, setUserOffsetMs] = useState<number>(0);
   const [showSettings, setShowSettings] = useState<boolean>(false);
   const [isTmaActive, setIsTmaActive] = useState<boolean>(false);
   const [songProgress, setSongProgress] = useState<number>(0);
   const [isMuted, setIsMuted] = useState<boolean>(false);
-
-  // 4-Stem Volume Mix State (0 to 1)
-  const [stemVolumes, setStemVolumes] = useState<{
-    drums: number;
-    bass: number;
-    chords: number;
-    lead: number;
-  }>({
-    drums: 1,
-    bass: 1,
-    chords: 1,
-    lead: 1,
-  });
+  const [isLoadingAudio, setIsLoadingAudio] = useState<boolean>(false);
+  const [audioError, setAudioError] = useState<string | null>(null);
+  const [activeTrackLabel, setActiveTrackLabel] = useState<string>('default song');
 
   // Dedicated SFX / Rhythm Cues Volume (0 to 1.5)
   const [sfxVolume, setSfxVolume] = useState<number>(1.2);
@@ -62,23 +56,50 @@ export const RhythmGame: React.FC = () => {
   const handleOffsetChange = (val: number) => {
     setUserOffsetMs(val);
     if (audioEngineRef.current) {
+      // Input-only calibration — visuals/progress keep raw audio time.
       audioEngineRef.current.setOffsetMs(val);
-    }
-  };
-
-  const handleStemChange = (stem: 'drums' | 'bass' | 'chords' | 'lead', val: number) => {
-    setStemVolumes((prev) => ({ ...prev, [stem]: val }));
-    if (audioEngineRef.current) {
-      audioEngineRef.current.setStemVolume(stem, val);
     }
   };
 
   const animationFrameId = useRef<number | null>(null);
   const eventsRef = useRef<ChartEvent[]>([]);
   eventsRef.current = chartEvents;
+  const gameStateRef = useRef<GameState>('IDLE');
+  gameStateRef.current = gameState;
 
-  // Initialize Engines & Telegram WebApp
+  const cancelGameLoop = useCallback(() => {
+    if (animationFrameId.current !== null) {
+      cancelAnimationFrame(animationFrameId.current);
+      animationFrameId.current = null;
+    }
+  }, []);
+
+  /** Effective round length: real buffer duration when available, else chart. */
+  const getEffectiveDurationMs = useCallback((): number => {
+    const audio = audioEngineRef.current;
+    if (audio && !audio.isTrackLooped()) {
+      const bufMs = audio.getTrackDurationMs();
+      if (Number.isFinite(bufMs) && bufMs > 0) return bufMs;
+    }
+    return ZEN_CHART_METADATA.songLengthMs;
+  }, []);
+
+  const finishRound = useCallback(() => {
+    cancelGameLoop();
+    const audio = audioEngineRef.current;
+    if (audio && audio.getIsPlaying()) {
+      audio.stopTrack();
+    }
+    if (gameStateRef.current === 'PLAYING') {
+      setGameState('FINISHED');
+      TMAService.hapticNotification('success');
+    }
+  }, [cancelGameLoop]);
+
+  // Initialize Engines & Telegram WebApp (StrictMode-safe: full cleanup).
   useEffect(() => {
+    let cancelled = false;
+
     const tmaDetected = TMAService.init();
     setIsTmaActive(tmaDetected);
 
@@ -93,7 +114,7 @@ export const RhythmGame: React.FC = () => {
 
     if (pixiContainerRef.current) {
       visual.init(pixiContainerRef.current).then(() => {
-        visual.setBpm(ZEN_CHART_METADATA.bpm);
+        if (!cancelled) visual.setBpm(ZEN_CHART_METADATA.bpm);
       }).catch((err) => {
         console.error('[VisualEngine] Initialization error:', err);
       });
@@ -102,13 +123,18 @@ export const RhythmGame: React.FC = () => {
     setChartEvents(getFreshChartEvents());
 
     return () => {
-      if (animationFrameId.current) cancelAnimationFrame(animationFrameId.current);
-      audio.stopTrack();
+      cancelled = true;
+      cancelGameLoop();
+      audio.dispose();
       visual.destroy();
+      audioEngineRef.current = null;
+      visualEngineRef.current = null;
+      inputJudgeRef.current = null;
     };
-  }, []);
+  }, [cancelGameLoop]);
 
-  // Main Game Loop for Miss Detection & Round Completion
+  // Main Game Loop for Miss Detection & Round Completion (single RAF owner).
+  // Reads raw audio-clock song time; lookahead timers only prepare cues.
   const runGameLoop = useCallback(() => {
     const audio = audioEngineRef.current;
     const judge = inputJudgeRef.current;
@@ -119,11 +145,12 @@ export const RhythmGame: React.FC = () => {
     if (audio.getIsPlaying()) {
       const songTimeMs = audio.getExactSongTime();
 
-      // Update progress bar
-      const progress = Math.min(100, (songTimeMs / ZEN_CHART_METADATA.songLengthMs) * 100);
+      // Update progress bar against the effective (real-buffer) duration.
+      const durationMs = getEffectiveDurationMs();
+      const progress = durationMs > 0 ? Math.min(100, (songTimeMs / durationMs) * 100) : 0;
       setSongProgress(progress);
 
-      // Check for missed notes
+      // Check for missed notes (raw audio time — calibration never shifts this).
       const misses: JudgeResult[] = judge.checkMissedNotes(songTimeMs, eventsRef.current);
       if (misses.length > 0) {
         misses.forEach(() => {
@@ -135,61 +162,93 @@ export const RhythmGame: React.FC = () => {
         setChartEvents([...eventsRef.current]);
       }
 
-      // Check if song has finished
-      if (songTimeMs >= ZEN_CHART_METADATA.songLengthMs) {
-        audio.stopTrack();
-        setGameState('FINISHED');
-        TMAService.hapticNotification('success');
+      // Check if song has finished (buffer truth, not a hardcoded constant).
+      if (songTimeMs >= durationMs) {
+        finishRound();
         return;
       }
+    } else if (gameStateRef.current === 'PLAYING') {
+      // Track stopped naturally (onended) without reaching the duration
+      // guard — e.g. a short custom track. Finish honestly.
+      finishRound();
+      return;
     }
 
     animationFrameId.current = requestAnimationFrame(runGameLoop);
-  }, []);
+  }, [finishRound, getEffectiveDurationMs]);
 
-  // Start / Restart round
+  // Start / Restart round (async audio path — never blocks on Start).
   const startRound = async () => {
     const audio = audioEngineRef.current;
     const judge = inputJudgeRef.current;
     const visual = visualEngineRef.current;
-    if (!audio || !judge || !visual) return;
+    if (!audio || !judge || !visual || isLoadingAudio) return;
 
-    // First user gesture triggers audio context resume
-    await audio.resumeContext();
+    cancelGameLoop();
+    setIsLoadingAudio(true);
+    setAudioError(null);
 
-    const freshEvents = getFreshChartEvents();
-    setChartEvents(freshEvents);
-    visual.setBpm(ZEN_CHART_METADATA.bpm);
-    visual.setChartEvents(freshEvents);
-    visual.resetScene();
+    try {
+      // First user gesture triggers audio context resume
+      await audio.resumeContext();
 
-    const initialScore = judge.resetScore();
-    setScore(initialScore);
-    setLastDelta(null);
-    setSongProgress(0);
+      const freshEvents = getFreshChartEvents();
+      setChartEvents(freshEvents);
+      visual.setBpm(ZEN_CHART_METADATA.bpm);
+      visual.setChartEvents(freshEvents);
+      visual.resetScene();
 
-    // Procedurally generate authentic 130 BPM 4-Stem Zen Track matching chart duration
-    const trackDurationSec = Math.ceil(ZEN_CHART_METADATA.songLengthMs / 1000);
-    const trackBuffer = audio.generateZenSoundtrack(ZEN_CHART_METADATA.bpm, trackDurationSec);
+      const initialScore = judge.resetScore();
+      setScore(initialScore);
+      setLastDelta(null);
+      setSongProgress(0);
 
-    audio.startTrack(trackBuffer, freshEvents, ZEN_CHART_METADATA.bpm, userOffsetMs);
-    // Apply current stem mix
-    audio.setStemVolume('drums', stemVolumes.drums);
-    audio.setStemVolume('bass', stemVolumes.bass);
-    audio.setStemVolume('chords', stemVolumes.chords);
-    audio.setStemVolume('lead', stemVolumes.lead);
-    setGameState('PLAYING');
+      // Resolve the genuine active track:
+      // 1) uploaded custom audio when present, 2) pre-rendered default asset
+      // (async), 3) tiny looped dev guide when the asset is absent.
+      // Chart compatibility limit: the chart stays fixed 130 BPM / ~160 s —
+      // custom audio is NOT re-mapped and there is no BPM detection.
+      let trackBuffer: AudioBuffer | null = audio.getCustomBuffer();
+      let loop = false;
+      if (trackBuffer) {
+        setActiveTrackLabel(`custom: ${audio.getCustomTrackName() ?? 'uploaded track'} (chart stays 130 BPM)`);
+      } else {
+        try {
+          trackBuffer = await audio.loadDefaultTrack();
+          setActiveTrackLabel('default song');
+        } catch {
+          trackBuffer = audio.generateDevGuideLoop(ZEN_CHART_METADATA.bpm);
+          loop = true;
+          setActiveTrackLabel('dev guide loop (asset missing — see public/audio/README)');
+        }
+      }
 
-    if (animationFrameId.current) cancelAnimationFrame(animationFrameId.current);
-    animationFrameId.current = requestAnimationFrame(runGameLoop);
+      audio.setSfxVolume(sfxVolume);
+      audio.setMuted(isMuted);
+      audio.startTrack(trackBuffer, freshEvents, ZEN_CHART_METADATA.bpm, userOffsetMs, {
+        loop,
+        onEnded: () => finishRound(),
+      });
+      setGameState('PLAYING');
+
+      cancelGameLoop();
+      animationFrameId.current = requestAnimationFrame(runGameLoop);
+    } catch (err) {
+      console.error('[RhythmGame] Failed to start round:', err);
+      setAudioError(err instanceof Error ? err.message : 'Failed to start audio');
+    } finally {
+      setIsLoadingAudio(false);
+    }
   };
 
-  // Primary Gameplay Tap Handler (sub-millisecond precision)
+  // Primary Gameplay Tap Handler (audio-clock synchronized timing).
+  // Uses PointerEvent.timeStamp mapped through TimingClock where feasible,
+  // with a safe fallback to the audio clock sampled in the handler.
   const handlePointerDown = (e: React.PointerEvent) => {
     e.preventDefault();
 
     if (gameState === 'IDLE' || gameState === 'FINISHED') {
-      startRound();
+      void startRound();
       return;
     }
 
@@ -200,12 +259,12 @@ export const RhythmGame: React.FC = () => {
     const visual = visualEngineRef.current;
     if (!audio || !judge || !visual) return;
 
-    // Dual-clock source of truth
-    const exactSongTime = audio.getExactSongTime();
-    const result = judge.handlePointerDown(exactSongTime, eventsRef.current);
+    const rawSongTime = audio.getExactSongTime();
+    const judgmentSongTime = audio.getTimingClock().inputToSongTimeMs(e.timeStamp);
+    const result = judge.handlePointerDown(judgmentSongTime, eventsRef.current);
 
     if (result) {
-      visual.triggerHitFeedback(result.rating, exactSongTime);
+      visual.triggerHitFeedback(result.rating, rawSongTime);
       if (result.rating === 'PERFECT' || result.rating === 'GOOD') {
         audio.playPourSound(result.rating);
       } else {
@@ -220,24 +279,44 @@ export const RhythmGame: React.FC = () => {
       setScore(judge.getScore());
       setChartEvents([...eventsRef.current]);
     }
+    // Ghost taps (no nearby candidate) are intentionally neutral: no score,
+    // combo, haptic, or visual change. See InputJudge docs.
   };
 
   const handleAudioUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file || !audioEngineRef.current) return;
+    const audio = audioEngineRef.current;
+    if (!file || !audio) return;
 
     try {
-      const url = URL.createObjectURL(file);
-      await audioEngineRef.current.loadAudio(url);
-      startRound();
+      // Decode directly from bytes (no object URL to leak). The uploaded
+      // buffer genuinely becomes the next active gameplay track.
+      const bytes = await file.arrayBuffer();
+      await audio.setCustomTrackFromBytes(bytes, file.name);
+      setActiveTrackLabel(`custom: ${file.name} (chart stays 130 BPM)`);
+      await startRound();
     } catch (err) {
       console.error('Failed to load custom audio file:', err);
+      setAudioError(err instanceof Error ? err.message : 'Failed to decode uploaded audio');
+    } finally {
+      e.target.value = '';
     }
   };
 
+  const handleClearCustomTrack = () => {
+    const audio = audioEngineRef.current;
+    if (!audio) return;
+    audio.clearCustomTrack();
+    setActiveTrackLabel('default song');
+  };
+
   const toggleSound = () => {
-    setIsMuted(!isMuted);
-    // Visual mute toggle
+    const next = !isMuted;
+    setIsMuted(next);
+    // Real mute via gain — timing continues uninterrupted.
+    if (audioEngineRef.current) {
+      audioEngineRef.current.setMuted(next);
+    }
   };
 
   return (
@@ -263,7 +342,7 @@ export const RhythmGame: React.FC = () => {
             <div className="flex items-center space-x-2 text-[10px] text-[#A69E92]">
               <span>{ZEN_CHART_METADATA.bpm} BPM</span>
               <span>•</span>
-              <span className="text-[#84D984]">Dual-Clock Engine</span>
+              <span className="text-[#84D984]">Audio-clock Engine</span>
               {isTmaActive && (
                 <>
                   <span>•</span>
@@ -314,7 +393,7 @@ export const RhythmGame: React.FC = () => {
           )}
         </div>
 
-        {/* Real-time Sub-millisecond Accuracy Delta Indicator */}
+        {/* Real-time audio-clock timing delta indicator */}
         <div className="flex items-center space-x-2">
           {lastDelta ? (
             <div
@@ -332,7 +411,9 @@ export const RhythmGame: React.FC = () => {
               </span>
             </div>
           ) : (
-            <div className="text-[11px] text-[#8C8375] font-mono">Окно: ±50ms / ±100ms</div>
+            <div className="text-[11px] text-[#8C8375] font-mono">
+              Окно: ±{TIMING_WINDOWS.perfectMs}ms / ±{TIMING_WINDOWS.goodMs}ms
+            </div>
           )}
         </div>
       </section>
@@ -345,6 +426,7 @@ export const RhythmGame: React.FC = () => {
             style={{ width: `${songProgress}%` }}
           />
         </div>
+        <div className="mt-1 text-[10px] font-mono text-[#8C8375] truncate">Трек: {activeTrackLabel}</div>
       </div>
 
       {/* Main Pixi.js v8 Canvas Viewport */}
@@ -369,16 +451,20 @@ export const RhythmGame: React.FC = () => {
             </h2>
             <p className="text-xs text-[#C4B9A7] max-w-[280px] mb-6 leading-relaxed">
               Попадайте в ритм {ZEN_CHART_METADATA.bpm} BPM, чтобы наливать горячий чай из бамбукового черпака.
-              Держите субмиллисекундный тайминг: <span className="text-[#FCE786] font-semibold">PERFECT (±50 мс)</span>.
+              Держите аудио-точный тайминг: <span className="text-[#FCE786] font-semibold">PERFECT (±{TIMING_WINDOWS.perfectMs} мс)</span>.
             </p>
 
             <button
               id="btn-start-game"
               type="button"
-              className="px-8 py-3.5 rounded-xl bg-gradient-to-r from-[#6E9855] to-[#487334] text-white font-bold text-sm tracking-wider uppercase shadow-lg shadow-[#487334]/40 hover:brightness-110 active:scale-95 transition-transform"
+              disabled={isLoadingAudio}
+              className="px-8 py-3.5 rounded-xl bg-gradient-to-r from-[#6E9855] to-[#487334] text-white font-bold text-sm tracking-wider uppercase shadow-lg shadow-[#487334]/40 hover:brightness-110 active:scale-95 transition-transform disabled:opacity-60"
             >
-              Коснитесь экрана для старта
+              {isLoadingAudio ? 'Загрузка аудио…' : 'Коснитесь экрана для старта'}
             </button>
+            {audioError && (
+              <p className="mt-3 text-[11px] text-red-400 max-w-[280px]">{audioError}</p>
+            )}
             <p className="mt-3 text-[11px] text-[#8C8375]">
               Активирует Web Audio API и тактильный отклик Telegram
             </p>
@@ -415,15 +501,15 @@ export const RhythmGame: React.FC = () => {
                 <span className="font-bold text-[#84D984]">{score.accuracy}%</span>
               </div>
               <div className="flex justify-between items-center">
-                <span className="text-[#FCE786]">PERFECT (≤45ms)</span>
+                <span className="text-[#FCE786]">PERFECT (≤{TIMING_WINDOWS.perfectMs}ms)</span>
                 <span className="font-bold text-[#FCE786]">{score.perfectCount}</span>
               </div>
               <div className="flex justify-between items-center">
-                <span className="text-[#84D984]">GOOD (≤90ms)</span>
+                <span className="text-[#84D984]">GOOD (≤{TIMING_WINDOWS.goodMs}ms)</span>
                 <span className="font-bold text-[#84D984]">{score.goodCount}</span>
               </div>
               <div className="flex justify-between items-center">
-                <span className="text-red-400">MISS (&gt;90ms)</span>
+                <span className="text-red-400">MISS (&gt;{TIMING_WINDOWS.goodMs}ms)</span>
                 <span className="font-bold text-red-400">{score.missCount}</span>
               </div>
               <div className="flex justify-between items-center border-t border-[#3A332C] pt-2">
@@ -435,15 +521,16 @@ export const RhythmGame: React.FC = () => {
             <button
               id="btn-restart-game"
               type="button"
-              className="px-8 py-3.5 rounded-xl bg-gradient-to-r from-[#6E9855] to-[#487334] text-white font-bold text-sm tracking-wider uppercase shadow-lg shadow-[#487334]/40 hover:brightness-110 active:scale-95 transition-transform flex items-center space-x-2"
+              disabled={isLoadingAudio}
+              className="px-8 py-3.5 rounded-xl bg-gradient-to-r from-[#6E9855] to-[#487334] text-white font-bold text-sm tracking-wider uppercase shadow-lg shadow-[#487334]/40 hover:brightness-110 active:scale-95 transition-transform flex items-center space-x-2 disabled:opacity-60"
               onPointerDown={(e) => e.stopPropagation()}
               onClick={(e) => {
                 e.stopPropagation();
-                startRound();
+                void startRound();
               }}
             >
               <RotateCcw className="w-4 h-4" />
-              <span>Заварить еще раз</span>
+              <span>{isLoadingAudio ? 'Загрузка…' : 'Заварить еще раз'}</span>
             </button>
           </div>
         )}
@@ -475,7 +562,7 @@ export const RhythmGame: React.FC = () => {
           <div className="space-y-3 text-xs">
             <div>
               <div className="flex justify-between text-[#C4B9A7] mb-1 font-mono">
-                <span>Аудио-оффсет:</span>
+                <span>Инпут-оффсет (только оценка):</span>
                 <span className="text-[#FCE786] font-bold">
                   {userOffsetMs > 0 ? `+${userOffsetMs}` : userOffsetMs} ms
                 </span>
@@ -508,7 +595,9 @@ export const RhythmGame: React.FC = () => {
                 ))}
               </div>
               <p className="text-[10px] text-[#8C8375] mt-1.5">
-                Сдвиньте влево, если нажатия запаздывают; вправо при Bluetooth-наушниках.
+                Положительный оффсет засчитывает нажатия раньше (компенсация задержки
+                Bluetooth/аудиовыхода). Влияет только на оценку нажатий — визуал, музыка
+                и пропуск нот не сдвигаются. По умолчанию 0.
               </p>
             </div>
 
@@ -535,79 +624,7 @@ export const RhythmGame: React.FC = () => {
             </p>
           </div>
 
-          {/* 4-Stem Audio Mixer */}
-          <div className="pt-2 border-t border-[#3A332C] space-y-2">
-            <span className="text-[11px] font-semibold text-[#F4F1EA] block">
-              Микшер 4-х Дорожек (Multi-Stem Mixer):
-            </span>
-            <div className="grid grid-cols-2 gap-2 text-[10px]">
-              <div>
-                <div className="flex justify-between text-[#C4B9A7] mb-0.5">
-                  <span>Ударные (Drums):</span>
-                  <span className="font-mono text-[#FCE786]">{Math.round(stemVolumes.drums * 100)}%</span>
-                </div>
-                <input
-                  type="range"
-                  min="0"
-                  max="1"
-                  step="0.05"
-                  value={stemVolumes.drums}
-                  onChange={(e) => handleStemChange('drums', parseFloat(e.target.value))}
-                  className="w-full accent-[#E2A931]"
-                />
-              </div>
-
-              <div>
-                <div className="flex justify-between text-[#C4B9A7] mb-0.5">
-                  <span>Бас (Bass):</span>
-                  <span className="font-mono text-[#FCE786]">{Math.round(stemVolumes.bass * 100)}%</span>
-                </div>
-                <input
-                  type="range"
-                  min="0"
-                  max="1"
-                  step="0.05"
-                  value={stemVolumes.bass}
-                  onChange={(e) => handleStemChange('bass', parseFloat(e.target.value))}
-                  className="w-full accent-[#84D984]"
-                />
-              </div>
-
-              <div>
-                <div className="flex justify-between text-[#C4B9A7] mb-0.5">
-                  <span>Кото/Аккорды:</span>
-                  <span className="font-mono text-[#FCE786]">{Math.round(stemVolumes.chords * 100)}%</span>
-                </div>
-                <input
-                  type="range"
-                  min="0"
-                  max="1"
-                  step="0.05"
-                  value={stemVolumes.chords}
-                  onChange={(e) => handleStemChange('chords', parseFloat(e.target.value))}
-                  className="w-full accent-[#4DA2FF]"
-                />
-              </div>
-
-              <div>
-                <div className="flex justify-between text-[#C4B9A7] mb-0.5">
-                  <span>Колокола/Лид:</span>
-                  <span className="font-mono text-[#FCE786]">{Math.round(stemVolumes.lead * 100)}%</span>
-                </div>
-                <input
-                  type="range"
-                  min="0"
-                  max="1"
-                  step="0.05"
-                  value={stemVolumes.lead}
-                  onChange={(e) => handleStemChange('lead', parseFloat(e.target.value))}
-                  className="w-full accent-[#D984FCE7]"
-                />
-              </div>
-            </div>
-          </div>
-
-          {/* Custom Audio Upload */}
+          {/* Custom Audio Upload (genuine active track) */}
           <div className="pt-2 border-t border-[#3A332C]">
             <label className="block text-[11px] text-[#C4B9A7] mb-1.5 font-medium flex items-center space-x-1.5">
               <Music className="w-3.5 h-3.5 text-[#4DA2FF]" />
@@ -620,6 +637,17 @@ export const RhythmGame: React.FC = () => {
               onChange={handleAudioUpload}
               className="text-xs text-[#A69E92] file:mr-2 file:py-1 file:px-2.5 file:rounded-md file:border-0 file:text-xs file:font-semibold file:bg-[#362C23] file:text-[#C4B9A7] hover:file:bg-[#45392D]"
             />
+            <p className="text-[10px] text-[#8C8375] mt-1.5">
+              Загруженный трек действительно становится игровым (без генерации поверх).
+              Ограничение: чарт фиксирован под 130 BPM — авто-битмап и BPM-детект не выполняются.
+            </p>
+            <button
+              type="button"
+              onClick={handleClearCustomTrack}
+              className="mt-1.5 px-2 py-0.5 rounded text-[10px] font-mono border bg-[#2C2723] text-[#C4B9A7] border-[#3A332C] hover:text-white"
+            >
+              Сбросить на дефолтный трек
+            </button>
           </div>
           </div>
         </div>
