@@ -86,6 +86,17 @@ describe('chart event integrity', () => {
     expect(tail).toBeGreaterThanOrEqual(5000);
     expect(tail).toBe(8979);
   });
+
+  it('answers the pushed snare at 95 968 ms, not the empty grid beat', () => {
+    // Bar 33 beat 2: drums play a pushed hit 72 ms before the grid beat
+    // (96 040 ms), with no transient on the beat itself — verified against
+    // drums/bass/other stems. Neighbours stay on-grid.
+    const pushed = ZEN_CHART_EVENTS.find((e) => e.id === 'b33_2_push');
+    expect(pushed?.timeMs).toBe(95968);
+    expect(ZEN_CHART_EVENTS.some((e) => e.timeMs === 96040)).toBe(false);
+    expect(ZEN_CHART_EVENTS.find((e) => e.id === 'b33_1')?.timeMs).toBe(95373);
+    expect(ZEN_CHART_EVENTS.find((e) => e.id === 'b33_3')?.timeMs).toBe(96707);
+  });
 });
 
 describe('chart runtime isolation', () => {

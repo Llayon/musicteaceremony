@@ -10,7 +10,15 @@ import {
 import { ChartEvent, HitRating } from '../types';
 import { SPRITESHEET_MANIFEST, generateSpritesheetCanvas } from '../assets/spritesheet';
 import { AudioEngine } from './AudioEngine';
-import { TIMING_WINDOWS } from './timing';
+import {
+  beatPulsePhase,
+  clampedDropletProgress,
+  dropletPosition,
+  isDropletVisible,
+  registerImpact,
+  takeDueImpacts,
+  type PendingImpact,
+} from './dropMotion';
 
 interface PooledNote {
   sprite: Sprite;
@@ -62,6 +70,9 @@ export class VisualEngine {
   // Dynamic tempo setting
   private currentBpm: number = 90;
 
+  // Beat-grid phase in ms (production track: FIRST_BEAT_MS = 40).
+  private firstBeatOffsetMs: number = 40;
+
   // Anticipation in beats (chart config: 1.5 at 90 BPM = 1000 ms flight).
   private approachBeats: number = 1.5;
 
@@ -84,6 +95,21 @@ export class VisualEngine {
     }
   }
 
+  public setFirstBeatOffsetMs(offsetMs: number): void {
+    if (Number.isFinite(offsetMs) && offsetMs >= 0) {
+      this.firstBeatOffsetMs = offsetMs;
+    }
+  }
+
+  /**
+   * Deferred visual impact: judgment (score/delta) happens at tap time, but
+   * splash/plate/cup fire when the droplet actually reaches the cup at
+   * note.timeMs. Replaces any pending impact for the same note (no doubles).
+   */
+  public registerHitImpact(noteId: string, rating: HitRating, impactTimeMs: number): void {
+    this.pendingImpacts = registerImpact(this.pendingImpacts, noteId, rating, impactTimeMs);
+  }
+
   // Target Hit position (Porcelain cup mouth)
   private readonly targetX = 180;
   private readonly targetY = 445;
@@ -98,6 +124,8 @@ export class VisualEngine {
   private teaFillLevel: number = 0; // 0 to 1
   private destroyed = false;
   private ringResetTimer: number | null = null;
+  // Deferred visual impacts (fire at note.timeMs, not at tap time).
+  private pendingImpacts: PendingImpact[] = [];
 
   constructor(audioEngine: AudioEngine) {
     this.audioEngine = audioEngine;
@@ -348,9 +376,10 @@ export class VisualEngine {
       this.updateCupTexture(false);
     }
 
-    // 2. Musically synchronized Beat Bounce (90 BPM tempo anchoring)
+    // 2. Musically synchronized Beat Bounce (90 BPM tempo anchoring,
+    // phased to the real beat grid — NOT to song-time zero).
     const beatMs = 60000 / this.currentBpm;
-    const beatPhase = (songTimeMs % beatMs) / beatMs;
+    const beatPhase = beatPulsePhase(songTimeMs, beatMs, this.firstBeatOffsetMs);
     // Rhythmic bounce pulse: sharp impact on beat, exponential decay
     const beatBounce = isPlaying ? Math.exp(-beatPhase * 4.5) : 0;
 
@@ -372,6 +401,17 @@ export class VisualEngine {
 
     // 3. Update Pooled Notes via Musically Quantized Visual Interpolation
     this.updateNotes(songTimeMs, isPlaying);
+
+    // 3b. Fire deferred visual impacts whose droplet just reached the cup.
+    // Judgment happened at tap time; splash/plate/cup resolve here, exactly
+    // at note.timeMs, so what the player sees matches what they hear.
+    if (isPlaying && this.pendingImpacts.length > 0) {
+      const { due, pending } = takeDueImpacts(this.pendingImpacts, songTimeMs);
+      this.pendingImpacts = pending;
+      for (const impact of due) {
+        this.triggerHitFeedback(impact.rating, songTimeMs);
+      }
+    }
 
     // 4. Update Feedback Plates Animation
     this.updateFeedbackPlates(songTimeMs);
@@ -421,6 +461,10 @@ export class VisualEngine {
    * Interpolates flying tea droplets based purely on exact song time.
    * Each droplet travels for exactly approachBeats (1.5 beats = 1000 ms
    * at 90 BPM — readable at this tempo, unlike the old 2-beat flight).
+   *
+   * Impact decoupling: judged (hit) droplets keep flying until note.timeMs
+   * — an early tap never vanishes the droplet mid-flight; the deferred
+   * impact visuals take over exactly at the cup.
    */
   private updateNotes(songTimeMs: number, isPlaying: boolean): void {
     const approachTimeMs = this.getApproachTimeMs();
@@ -430,16 +474,8 @@ export class VisualEngine {
     if (isPlaying) {
       for (let i = 0; i < this.activeEvents.length; i++) {
         const note = this.activeEvents[i];
-        if (note.status !== 'pending') continue;
-
-        const startTime = note.timeMs - approachTimeMs;
-        // Keep the droplet visible until the GOOD window closes so visuals
-        // agree with the judge's auto-miss timing (single source of truth).
-        const endTime = note.timeMs + TIMING_WINDOWS.goodMs;
-
-        if (songTimeMs >= startTime && songTimeMs <= endTime) {
-          visibleNotes.push(note);
-        }
+        if (!isDropletVisible(note.status, songTimeMs, note.timeMs, approachTimeMs)) continue;
+        visibleNotes.push(note);
       }
     }
 
@@ -477,18 +513,24 @@ export class VisualEngine {
       }
 
       // Mathematical visual interpolation:
-      // progress = 0.0 at launch (note.timeMs - approachTimeMs), 1.0 exactly at note.timeMs
-      const progress = (songTimeMs - (note.timeMs - approachTimeMs)) / approachTimeMs;
-      const clampedP = Math.min(1.0, Math.max(0.0, progress));
+      // progress = 0.0 at launch (note.timeMs - approachTimeMs), 1.0 exactly
+      // at note.timeMs. Position uses CLAMPED progress: past note.timeMs the
+      // droplet rests in the cup zone until resolution — never overshoots.
+      const { x: currentX, y: currentY } = dropletPosition(
+        songTimeMs,
+        note.timeMs,
+        approachTimeMs,
+        this.spawnX,
+        this.spawnY,
+        this.targetX,
+        this.targetY
+      );
 
-      // Parabolic flight arc from Ladle to Cup
-      const currentX = this.spawnX + (this.targetX - this.spawnX) * progress;
-      const linearY = this.spawnY + (this.targetY - this.spawnY) * progress;
-      // Arc height (rises in mid-air on beat 1, plunges into cup on beat 2)
-      const arc = -Math.sin(clampedP * Math.PI) * 55;
+      poolItem.sprite.position.set(currentX, currentY);
 
-      poolItem.sprite.position.set(currentX, linearY + arc);
-
+      // Smooth tangent orientation + approach scale use the same clamped
+      // progress, so a late droplet rests in the cup instead of overshooting.
+      const clampedP = clampedDropletProgress(songTimeMs, note.timeMs, approachTimeMs);
       // Smooth tangent orientation: droplet dynamically angles along its arc trajectory
       const vx = this.targetX - this.spawnX; // -115
       const vy = (this.targetY - this.spawnY) - 55 * Math.PI * Math.cos(clampedP * Math.PI);
@@ -660,6 +702,7 @@ export class VisualEngine {
   public resetScene(): void {
     this.teaFillLevel = 0;
     this.cupReactionResetTime = 0;
+    this.pendingImpacts = [];
     this.updateCupTexture(false);
 
     // Reset all pool items

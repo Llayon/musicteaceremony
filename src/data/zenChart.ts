@@ -13,6 +13,10 @@ import { ChartMetadata, ChartNoteDefinition, RuntimeChartNote } from '../types';
  * - intro 0–10 s (Rhodes only, no drums), outro fill 139.4–143.4 s,
  *   final Rhodes swell on beat 225 (150.04 s), silence from ≈156.5 s
  * - vocals stem is digitally silent and is excluded from the master
+ * - one deliberate off-grid exception: bar 33 beat 2 sits on the pushed
+ *   snare at 95 968 ms (−72 ms vs the grid beat at 96 040 ms, where the
+ *   drums play nothing — verified against drums/bass/other transients;
+ *   neighbours b33.b1 (+8 ms) and b33.b3 (+1 ms) stay on-grid)
  *
  * Gameplay direction (Rhythm Heaven, not note-highway): taps answer musical
  * phrases — backbeat rimshots, section downbeats, fill accents. Woodblock
@@ -133,7 +137,11 @@ function authorChart(): ChartNoteDefinition[] {
   events.push(...buildBar(30, [1, 3]));
   events.push(...buildBar(31, [1, 3]));
   events.push(...buildBar(32, [1, 2, 3, { b: 3, sub: 0.5 }, 4])); // build 92–96 s
-  events.push(...buildBar(33, [1, 2, 3, 4]));
+  events.push(...buildBar(33, [1]));
+  // Pushed snare: answers the real hit at 95 968 ms, not the empty grid
+  // beat at 96 040 ms (no drum transient there; strongest nearby is −72 ms).
+  events.push({ id: 'b33_2_push', timeMs: 95968, type: 'tap' as const });
+  events.push(...buildBar(33, [3, 4]));
   events.push(...buildBar(34, [1, 3]));
   events.push(...buildBar(35, [1, 2, 3, 4]));
   events.push(...buildBar(36, [1, 3]));

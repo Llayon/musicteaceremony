@@ -122,7 +122,11 @@ export const RhythmGame: React.FC = () => {
 
     if (pixiContainerRef.current) {
       visual.init(pixiContainerRef.current).then(() => {
-        if (!cancelled) visual.setBpm(ZEN_CHART_METADATA.bpm);
+        if (!cancelled) {
+          visual.setBpm(ZEN_CHART_METADATA.bpm);
+          visual.setApproachBeats(ZEN_CHART_METADATA.approachBeats);
+          visual.setFirstBeatOffsetMs(ZEN_CHART_METADATA.firstBeatOffsetMs);
+        }
       }).catch((err) => {
         console.error('[VisualEngine] Initialization error:', err);
       });
@@ -204,6 +208,7 @@ export const RhythmGame: React.FC = () => {
       setChartEvents(freshEvents);
       visual.setBpm(ZEN_CHART_METADATA.bpm);
       visual.setApproachBeats(ZEN_CHART_METADATA.approachBeats);
+      visual.setFirstBeatOffsetMs(ZEN_CHART_METADATA.firstBeatOffsetMs);
       visual.setChartEvents(freshEvents);
       visual.resetScene();
 
@@ -270,12 +275,14 @@ export const RhythmGame: React.FC = () => {
     const visual = visualEngineRef.current;
     if (!audio || !judge || !visual) return;
 
-    const rawSongTime = audio.getExactSongTime();
     const judgmentSongTime = audio.getTimingClock().inputToSongTimeMs(e.timeStamp);
     const result = judge.handlePointerDown(judgmentSongTime, eventsRef.current);
 
-    if (result) {
-      visual.triggerHitFeedback(result.rating, rawSongTime);
+    if (result?.note) {
+      // Judgment (score/delta/sound) resolves NOW at tap time; the droplet
+      // keeps flying and splash/plate/cup fire at note.timeMs via the
+      // engine's deferred impact queue — what the player sees matches the music.
+      visual.registerHitImpact(result.note.id, result.rating, result.note.timeMs);
       if (result.rating === 'PERFECT' || result.rating === 'GOOD') {
         audio.playPourSound(result.rating);
       } else {
