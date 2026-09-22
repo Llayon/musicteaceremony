@@ -16,7 +16,7 @@ export const DEFAULT_TRACK_URL = `${import.meta.env.BASE_URL}audio/zen-tea-cerem
 
 /**
  * Light fallback mix for weak phones: mono fold-down, 128 kbps (~2.5 MB).
- * Decodes to ~30 MB PCM instead of ~122 MB stereo. Tried automatically when
+ * Decodes to ~30 MB PCM instead of ~61 MB stereo. Tried automatically when
  * the full master fails to fetch/decode; the HUD badges it honestly.
  */
 export const LIGHT_TRACK_URL = `${import.meta.env.BASE_URL}audio/zen-tea-ceremony.light.mp3`;

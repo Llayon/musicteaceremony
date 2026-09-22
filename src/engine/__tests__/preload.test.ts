@@ -178,4 +178,97 @@ describe('default-track preload (stage 1: fetch-only, no AudioContext)', () => {
       vi.useRealTimers();
     }
   });
+
+  it('startup phases walk unlocking->fetching->decoding-stereo->ready with a log', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => streamResponse(new Uint8Array([1, 2]))));
+    const decodeAudioData = vi.fn(
+      async (_bytes: ArrayBuffer): Promise<AudioBuffer> => ({ duration: 159.019 }) as AudioBuffer
+    );
+    vi.stubGlobal('window', fakeWindow(decodeAudioData));
+
+    const engine = new AudioEngine();
+    const phases: string[] = [];
+    engine.subscribeStartupPhase((p) => phases.push(p));
+    await engine.loadDefaultTrack();
+
+    expect(phases).toEqual(['idle', 'unlocking', 'fetching', 'decoding-stereo', 'ready']);
+    expect(engine.getStartupPhase()).toBe('ready');
+    const log = engine.getStartupLog().join('\n');
+    expect(log).toMatch(/AudioContext created/);
+    expect(log).toMatch(/resume resolved \(state after=\w+\)/);
+    expect(log).toMatch(/decode stereo resolved in \d+ms/);
+  });
+
+  it('interrupted state triggers resume (not just suspended)', async () => {
+    const resume = vi.fn(async () => {});
+    const ctx = {
+      currentTime: 0,
+      state: 'interrupted',
+      sampleRate: 48000,
+      destination: {},
+      resume,
+      createGain: () => ({ gain: { setValueAtTime: () => {} }, connect: () => {} }),
+      decodeAudioData: async () => ({ duration: 1 }) as AudioBuffer,
+    };
+    vi.stubGlobal('window', { AudioContext: function () { return ctx; } } as unknown as Window & typeof globalThis);
+
+    const engine = new AudioEngine();
+    await engine.resumeContext();
+    expect(resume).toHaveBeenCalledTimes(1);
+    expect(engine.getStartupLog().join('\n')).toMatch(/state before=interrupted/);
+  });
+
+  it('running state skips resume entirely', async () => {
+    const resume = vi.fn(async () => {});
+    const ctx = {
+      currentTime: 0,
+      state: 'running',
+      sampleRate: 48000,
+      destination: {},
+      resume,
+      createGain: () => ({ gain: { setValueAtTime: () => {} }, connect: () => {} }),
+      decodeAudioData: async () => ({ duration: 1 }) as AudioBuffer,
+    };
+    vi.stubGlobal('window', { AudioContext: function () { return ctx; } } as unknown as Window & typeof globalThis);
+
+    const engine = new AudioEngine();
+    await engine.resumeContext();
+    expect(resume).not.toHaveBeenCalled();
+  });
+
+  it('timed-out stereo orphan is dropped, never cached alongside light', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: unknown) =>
+      streamResponse(new Uint8Array(String(url).includes('.light.mp3') ? [4] : [1, 2, 3]))
+    ));
+    let resolveStereo!: (buf: AudioBuffer) => void;
+    const stereoHung = new Promise<AudioBuffer>((resolve) => {
+      resolveStereo = resolve;
+    });
+    const lightBuffer = { duration: 159.019 } as AudioBuffer;
+    const stereoBuffer = { duration: 159.019 } as AudioBuffer;
+    const decodeAudioData = vi.fn(
+      async (_bytes: ArrayBuffer): Promise<AudioBuffer> => lightBuffer
+    );
+    decodeAudioData.mockImplementationOnce(() => stereoHung);
+    vi.stubGlobal('window', fakeWindow(decodeAudioData));
+
+    vi.useFakeTimers();
+    try {
+      const engine = new AudioEngine();
+      const pending = engine.loadDefaultTrack();
+      // Stereo watchdog (30 s) fires -> light layer resolves the race.
+      await vi.advanceTimersByTimeAsync(30_000);
+      const buf = await pending;
+      expect(buf).toBe(lightBuffer);
+      expect(engine.usedLightTrack()).toBe(true);
+
+      // The stereo orphan resolves late: it must be dropped, not cached.
+      resolveStereo(stereoBuffer);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(await engine.loadDefaultTrack()).toBe(lightBuffer);
+      expect(engine.usedLightTrack()).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

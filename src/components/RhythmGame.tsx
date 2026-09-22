@@ -7,9 +7,37 @@ import { TIMING_WINDOWS } from '../engine/timing';
 import { ChartEvent, GameScore } from '../types';
 import { ZEN_CHART_METADATA, getFreshChartEvents, getLastEventTimeMs } from '../data/zenChart';
 import { perfMark } from '../engine/perf';
+import type { StartupPhase } from '../engine/AudioEngine';
 import { TMAService } from '../services/tma';
 
 type GameState = 'IDLE' | 'PLAYING' | 'PAUSED' | 'FINISHED';
+
+/**
+ * Phase-driven Start text. The phase (WHAT the engine is doing) and the
+ * fetch progress (HOW MUCH arrived) are independent facts: progress must
+ * never rewrite the phase. A cached 100% snapshot means "fetch done",
+ * not "still downloading".
+ */
+function phaseText(phase: StartupPhase, progress: number | null): string {
+  switch (phase) {
+    case 'unlocking':
+      return 'Включаем звук…';
+    case 'fetching':
+      return progress !== null && progress < 1
+        ? `Загрузка музыки… ${Math.round(progress * 100)}%`
+        : 'Загрузка музыки…';
+    case 'decoding-stereo':
+      return 'Декодируем основной трек…';
+    case 'decoding-light':
+      return 'Пробуем облегчённый трек…';
+    case 'starting':
+      return 'Запускаем…';
+    case 'error':
+      return 'Не удалось загрузить музыку';
+    default:
+      return 'Загрузка аудио…';
+  }
+}
 
 export const RhythmGame: React.FC = () => {
   const pixiContainerRef = useRef<HTMLDivElement>(null);
@@ -51,13 +79,15 @@ export const RhythmGame: React.FC = () => {
   const [isLoadingAudio, setIsLoadingAudio] = useState<boolean>(false);
   const [audioError, setAudioError] = useState<string | null>(null);
   const [activeTrackLabel, setActiveTrackLabel] = useState<string>('default song');
-  // Start-time loading display: fetch % when the song is still downloading,
-  // stage text otherwise. Never blocks the game: any load failure falls
-  // back to the badged dev guide loop so Start always resolves.
+  // Start-time loading display, driven SOLELY by the engine phase machine.
+  // fetchProgress (0..1) only feeds the % counter inside the 'fetching'
+  // phase — it never changes the phase text (a cached 100% snapshot means
+  // "fetch done, now decoding", not "still downloading").
   const [loadProgress, setLoadProgress] = useState<number | null>(null);
-  const [loadStageText, setLoadStageText] = useState<string | null>(null);
-  // True when Start takes suspiciously long — show reassurance, not silence.
-  const [loadSlow, setLoadSlow] = useState<boolean>(false);
+  const [startupPhase, setStartupPhase] = useState<StartupPhase>('idle');
+  // Timestamped engine log ("+12ms resume resolved (state=running)") —
+  // one iPhone run of this list identifies the hanging stage.
+  const [startupLog, setStartupLog] = useState<string[]>([]);
 
   // Dedicated SFX / Rhythm Cues Volume (0 to 1.5)
   const [sfxVolume, setSfxVolume] = useState<number>(1.2);
@@ -229,41 +259,29 @@ export const RhythmGame: React.FC = () => {
     setIsLoadingAudio(true);
     setAudioError(null);
     setLoadProgress(null);
-    setLoadSlow(false);
-    // Stage order matters for diagnosis: sound unlock first, then fetch /
-    // decode. A hang on "Включаем звук…" means the browser refused resume;
-    // a hang on "Декодируем…" means the decoder is stuck (watchdogged).
-    setLoadStageText('Включаем звук…');
 
-    // Progress subscription (unsubscribed in finally). Chunks arrive a few
-    // dozen times per download — event-driven, not a render loop.
-    // NOTE: a cached snapshot at fraction 1 means "fetch done, now
-    // decoding" — never display it as download progress.
+    // Phase + progress subscriptions (unsubscribed in finally). The phase
+    // callback also snapshots the engine diagnostic log, so the settings
+    // modal can show exactly where a slow phone is stuck.
+    const syncPhase = () => {
+      setStartupPhase(audio.getStartupPhase());
+      setStartupLog(audio.getStartupLog());
+    };
+    const unsubscribePhase = audio.subscribeStartupPhase(() => syncPhase());
+    syncPhase();
+
+    // Progress numbers only — this callback must NEVER set phase text.
     const unsubscribeFetchProgress = audio.subscribeFetchProgress((p) => {
       if (p.total) {
-        const fraction = Math.min(1, p.received / p.total);
-        setLoadProgress(fraction);
-        setLoadStageText(
-          fraction >= 1 ? 'Декодируем аудио…' : `Загрузка музыки… ${Math.round(fraction * 100)}%`
-        );
+        setLoadProgress(Math.min(1, p.received / p.total));
       }
     });
-
-    // Long-wait reassurance: if Start takes >25 s (slow decode on an old
-    // phone), say so explicitly instead of a frozen-looking spinner.
-    const slowTimer = window.setTimeout(() => {
-      setLoadSlow(true);
-    }, 25_000);
 
     try {
       // First user gesture triggers audio context resume (watchdogged —
       // a refused unlock fails loudly instead of hanging Start).
+      // The engine phase machine drives the overlay text from here on.
       await audio.resumeContext();
-      // Honest loading text past this point: decoding when bytes are
-      // cached, download % while the fetch is still running. Either way
-      // Start always resolves — load failure falls back to the badged
-      // dev guide loop below.
-      setLoadStageText(audio.isPreloaded() ? 'Декодируем аудио…' : 'Загрузка музыки…');
 
       const freshEvents = getFreshChartEvents();
       setChartEvents(freshEvents);
@@ -303,7 +321,6 @@ export const RhythmGame: React.FC = () => {
           trackBuffer = audio.generateDevGuideLoop(ZEN_CHART_METADATA.bpm);
           loop = true;
           setActiveTrackLabel('dev guide loop (asset missing — see public/audio/README)');
-          setLoadStageText('Не удалось загрузить музыку — играем на метрономе');
         }
       }
 
@@ -323,12 +340,10 @@ export const RhythmGame: React.FC = () => {
       console.error('[RhythmGame] Failed to start round:', err);
       setAudioError(err instanceof Error ? err.message : 'Failed to start audio');
     } finally {
-      window.clearTimeout(slowTimer);
+      unsubscribePhase();
       unsubscribeFetchProgress();
       setIsLoadingAudio(false);
       setLoadProgress(null);
-      setLoadStageText(null);
-      setLoadSlow(false);
     }
   };
 
@@ -524,6 +539,12 @@ export const RhythmGame: React.FC = () => {
             className="p-2 rounded-lg bg-[#26211C] hover:bg-[#322B24] text-[#C4B9A7] transition-colors"
             onClick={(e) => {
               e.stopPropagation();
+              // Refresh diagnostics snapshot when opening settings.
+              const audio = audioEngineRef.current;
+              if (audio) {
+                setStartupPhase(audio.getStartupPhase());
+                setStartupLog(audio.getStartupLog());
+              }
               setShowSettings(!showSettings);
             }}
             title="Калибровка и настройки"
@@ -625,16 +646,11 @@ export const RhythmGame: React.FC = () => {
               disabled={isLoadingAudio}
               className="px-8 py-3.5 rounded-xl bg-gradient-to-r from-[#6E9855] to-[#487334] text-white font-bold text-sm tracking-wider uppercase shadow-lg shadow-[#487334]/40 hover:brightness-110 active:scale-95 transition-transform disabled:opacity-60"
             >
-              {isLoadingAudio
-                ? loadProgress !== null && loadProgress < 1
-                  ? `Загрузка музыки… ${Math.round(loadProgress * 100)}%`
-                  : loadStageText ?? 'Загрузка аудио…'
-                : 'Коснитесь экрана для старта'}
+              {isLoadingAudio ? phaseText(startupPhase, loadProgress) : 'Коснитесь экрана для старта'}
             </button>
-            {isLoadingAudio && loadSlow && (
-              <p className="mt-3 text-[11px] text-[#A69E92] max-w-[280px]">
-                Всё ещё готовим музыку — на медленных телефонах декодирование занимает до минуты.
-                Игра стартует сама, ждать ничего не нужно.
+            {isLoadingAudio && startupPhase !== 'idle' && (
+              <p className="mt-3 text-[11px] font-mono text-[#8C8375] max-w-[280px]">
+                фаза: {startupPhase}
               </p>
             )}
             {audioError && (
@@ -706,11 +722,7 @@ export const RhythmGame: React.FC = () => {
             >
               <RotateCcw className="w-4 h-4" />
               <span>
-                {isLoadingAudio
-                  ? loadProgress !== null && loadProgress < 1
-                    ? `Загрузка… ${Math.round(loadProgress * 100)}%`
-                    : loadStageText ?? 'Загрузка…'
-                  : 'Заварить еще раз'}
+                {isLoadingAudio ? phaseText(startupPhase, loadProgress) : 'Заварить еще раз'}
               </span>
             </button>
           </div>
@@ -849,6 +861,25 @@ export const RhythmGame: React.FC = () => {
             >
               Сбросить на дефолтный трек
             </button>
+          </div>
+
+          {/* Startup diagnostics: timestamped engine log. One slow-phone run
+              of this list identifies the hanging stage (unlock vs fetch vs
+              stereo vs light decode). */}
+          <div className="pt-2 border-t border-[#3A332C]">
+            <span className="text-[11px] font-semibold text-[#F4F1EA] block mb-1">
+              Диагностика запуска:
+            </span>
+            <p className="text-[10px] font-mono text-[#A69E92]">
+              фаза: <strong className="text-[#FCE786]">{startupPhase}</strong>
+            </p>
+            {startupLog.length > 0 ? (
+              <pre className="mt-1 max-h-32 overflow-y-auto text-[10px] font-mono text-[#8C8375] whitespace-pre-wrap">
+                {startupLog.join('\n')}
+              </pre>
+            ) : (
+              <p className="text-[10px] text-[#8C8375]">Пока пусто — лог появится после первого Start.</p>
+            )}
           </div>
           </div>
         </div>

@@ -8,6 +8,28 @@ import { perfMark } from './perf';
 export type AudioLoadStage = 'idle' | 'downloading' | 'decoding' | 'ready' | 'error';
 
 /**
+ * Startup phase — WHAT the engine is doing right now. Kept strictly
+ * separate from fetchProgress (0..1): progress must NEVER rewrite phase.
+ * This separation is what makes the Start overlay truthful ("Включаем
+ * звук…" vs "Декодируем основной трек…" are different facts).
+ */
+export type StartupPhase =
+  | 'idle'
+  | 'unlocking'
+  | 'fetching'
+  | 'decoding-stereo'
+  | 'decoding-light'
+  | 'starting'
+  | 'ready'
+  | 'error';
+
+export interface StartupLogEntry {
+  /** ms since the first logged event of this engine instance. */
+  tMs: number;
+  event: string;
+}
+
+/**
  * Decode watchdog per attempt: past this the attempt fails over to the next
  * layer instead of waiting forever (decodeAudioData cannot be aborted).
  */
@@ -75,6 +97,67 @@ export class AudioEngine {
   private lastFetchProgress: FetchBytesProgress | null = null;
   private fetchProgressListeners = new Set<(p: FetchBytesProgress) => void>();
 
+  // Startup diagnostics: phase (what) + timestamped log (when/what happened).
+  // One iPhone run of this log is enough to identify the hanging stage.
+  private startupPhase: StartupPhase = 'idle';
+  private phaseListeners = new Set<(p: StartupPhase) => void>();
+  private startupLog: StartupLogEntry[] = [];
+  private startupT0: number | null = null;
+  private startupAttempt = 0;
+
+  private nowMs(): number {
+    try {
+      if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+        return performance.now();
+      }
+    } catch {
+      // Fall through to Date.
+    }
+    return Date.now();
+  }
+
+  private logStartup(event: string): void {
+    if (this.startupT0 === null) this.startupT0 = this.nowMs();
+    this.startupLog.push({ tMs: Math.round(this.nowMs() - this.startupT0), event });
+    if (this.startupLog.length > 80) {
+      this.startupLog.splice(0, this.startupLog.length - 80);
+    }
+  }
+
+  private setPhase(phase: StartupPhase): void {
+    this.startupPhase = phase;
+    for (const cb of this.phaseListeners) {
+      try {
+        cb(phase);
+      } catch {
+        // Listener errors must never break loading.
+      }
+    }
+  }
+
+  /** Current startup phase (see StartupPhase). */
+  public getStartupPhase(): StartupPhase {
+    return this.startupPhase;
+  }
+
+  /** Subscribe to phase transitions (immediate snapshot on subscribe). */
+  public subscribeStartupPhase(cb: (p: StartupPhase) => void): () => void {
+    this.phaseListeners.add(cb);
+    try {
+      cb(this.startupPhase);
+    } catch {
+      // Listener errors must never break loading.
+    }
+    return () => {
+      this.phaseListeners.delete(cb);
+    };
+  }
+
+  /** Human-readable timestamped log, e.g. ["+12ms resume resolved (state=running)"]. */
+  public getStartupLog(): string[] {
+    return this.startupLog.map((e) => `+${e.tMs}ms ${e.event}`);
+  }
+
   // Lifecycle: suppress the onended callback for manual stops so a manual
   // stop never produces a duplicate "completed" callback.
   private suppressEndedEvent = false;
@@ -91,6 +174,9 @@ export class AudioEngine {
 
   /**
    * Initializes or resumes AudioContext to bypass mobile autoplay restrictions.
+   * Resume is attempted for ANY non-running state (suspended AND WebKit's
+   * 'interrupted' — checking only 'suspended' silently skips the resume call
+   * on iOS and hands a dead context downstream).
    */
   public async resumeContext(): Promise<AudioContext> {
     if (!this.audioCtx) {
@@ -106,18 +192,29 @@ export class AudioEngine {
       this.masterGain.connect(this.audioCtx.destination);
       this.sfxGain.connect(this.audioCtx.destination);
       this.clock.attach(this.audioCtx);
+      this.logStartup(`AudioContext created (state=${this.audioCtx.state})`);
     }
 
-    if (this.audioCtx.state === 'suspended') {
-      await withTimeout(
-        this.audioCtx.resume(),
-        RESUME_TIMEOUT_MS,
-        () =>
-          new Error(
-            'Sound unlock timed out: the browser did not resume audio. ' +
-              'Tap Start again (a real tap, not auto-play).'
-          )
-      );
+    if (this.audioCtx.state !== 'running') {
+      const before = this.audioCtx.state;
+      this.logStartup(`resume called (state before=${before})`);
+      try {
+        await withTimeout(
+          this.audioCtx.resume(),
+          RESUME_TIMEOUT_MS,
+          () =>
+            new Error(
+              'Sound unlock timed out: the browser did not resume audio. ' +
+                'Tap Start again (a real tap, not auto-play).'
+            )
+        );
+      } catch (err) {
+        this.logStartup(
+          `resume rejected: ${err instanceof Error ? err.message : String(err)}`
+        );
+        throw err;
+      }
+      this.logStartup(`resume resolved (state after=${this.audioCtx.state})`);
     }
 
     return this.audioCtx;
@@ -295,39 +392,61 @@ export class AudioEngine {
    * Stage 2 — runs on Start (after the user gesture): reuses preloaded
    * bytes when available, otherwise fetches first.
    *
-   * Layered fallback (weak phones): full stereo first; when its fetch or
-   * decode fails, the light mono mix (~30 MB PCM instead of ~122 MB) is
-   * tried automatically. Only when both fail does the caller fall back to
-   * the badged dev guide loop. Throws in that case — never hangs: fetch
-   * is stall-bounded and each decode is watchdogged (decodeAudioData has
-   * no abort API). A late-resolving decode still warms the cache.
+   * Layered fallback (weak phones): full stereo first (~61 MB PCM); when
+   * its fetch or decode fails, the light mono mix (~30 MB PCM) is tried.
+   * Only when both fail does the caller fall back to the badged dev guide
+   * loop. Throws in that case — never hangs: fetch is stall-bounded and
+   * each decode is watchdogged (decodeAudioData has no abort API).
+   *
+   * No parallel decoders and no double cache: a timed-out stereo decode
+   * keeps running in the background (it cannot be cancelled), so its late
+   * result is deliberately DROPPED, not cached — otherwise a struggling
+   * phone would briefly hold stereo AND mono buffers at once, the exact
+   * opposite of the fallback's goal. End state is always a single buffer.
    */
   public async loadDefaultTrack(): Promise<AudioBuffer> {
     if (this.defaultBuffer) return this.defaultBuffer;
     if (this.lightBuffer) return this.lightBuffer;
     if (this.defaultPromise) return this.defaultPromise;
 
+    this.startupAttempt += 1;
+    this.logStartup(`--- load attempt #${this.startupAttempt} ---`);
     this.defaultPromise = (async () => {
+      this.setPhase('unlocking');
       const ctx = await this.resumeContext();
-      this.loadStage = 'decoding';
-      perfMark('audio-decode-start');
       try {
-        const bytes = this.preloadedBytes ?? (await this.preloadDefaultTrackBytes());
-        const decoded = await this.decodeAndCache(ctx, bytes, false);
+        if (!this.preloadedBytes) {
+          this.setPhase('fetching');
+          this.logStartup('fetch stereo started');
+          await this.preloadDefaultTrackBytes();
+          this.logStartup('fetch stereo finished');
+        }
+        this.setPhase('decoding-stereo');
+        const decoded = await this.decodeTracked(ctx, this.preloadedBytes as ArrayBuffer, false);
         this.lastUsedLight = false;
+        this.setPhase('ready');
         return decoded;
       } catch (stereoErr) {
         // Layer 2: light mono mix. Kinder to weak-phone decoders.
         perfMark('audio-light-fallback');
+        this.logStartup(
+          `stereo layer failed: ${stereoErr instanceof Error ? stereoErr.message : String(stereoErr)}`
+        );
         this.lastFetchProgress = null;
+        this.setPhase('fetching');
+        this.logStartup('fetch light started');
         const lightBytes =
           this.lightBytes ?? (await this.fetchTrackBytes(LIGHT_TRACK_URL));
         this.lightBytes = lightBytes;
+        this.logStartup('fetch light finished');
+        this.setPhase('decoding-light');
         try {
-          const decoded = await this.decodeAndCache(ctx, lightBytes, true);
+          const decoded = await this.decodeTracked(ctx, lightBytes, true);
           this.lastUsedLight = true;
+          this.setPhase('ready');
           return decoded;
         } catch (lightErr) {
+          this.setPhase('error');
           throw lightErr instanceof Error ? lightErr : stereoErr;
         }
       }
@@ -338,6 +457,7 @@ export class AudioEngine {
     } catch (err) {
       this.defaultPromise = null;
       this.loadStage = 'error';
+      this.setPhase('error');
       throw err;
     }
   }
@@ -347,35 +467,35 @@ export class AudioEngine {
     return this.lastUsedLight;
   }
 
-  private async decodeAndCache(
+  private async decodeTracked(
     ctx: AudioContext,
     bytes: ArrayBuffer,
     light: boolean
   ): Promise<AudioBuffer> {
+    const label = light ? 'light' : 'stereo';
     // Slice: decodeAudioData may detach the input in some browsers —
     // the cached copy stays intact for potential re-decodes.
-    const decodePromise = ctx.decodeAudioData(bytes.slice(0));
-    const store = (buf: AudioBuffer) => {
-      if (light) {
-        if (!this.lightBuffer) this.lightBuffer = buf;
-      } else if (!this.defaultBuffer) {
-        this.defaultBuffer = buf;
-      }
-    };
-    // A late success still warms the cache for the next round.
-    void decodePromise.then(store, () => {
-      // Already handled via the race below; never unhandled.
-    });
+    const t0 = this.nowMs();
+    this.logStartup(`decode ${label} started`);
+    // NOTE: no late-result caching by design. If this decode times out, a
+    // fallback decode starts while this one may still run (it cannot be
+    // cancelled); caching a late stereo result on top of the light buffer
+    // would pin both in memory on a struggling phone.
     const decoded = await withTimeout(
-      decodePromise,
+      ctx.decodeAudioData(bytes.slice(0)),
       DECODE_TIMEOUT_MS,
       () =>
         new Error(
-          `Decoding the default track took longer than ${(DECODE_TIMEOUT_MS / 1000).toFixed(0)} s — ` +
-            `this phone may be too slow for 159 s of stereo. Falling back.`
+          `Decoding the default track took longer than ${(DECODE_TIMEOUT_MS / 1000).toFixed(0)} s. Falling back.`
         )
     );
-    store(decoded);
+    const elapsed = Math.round(this.nowMs() - t0);
+    this.logStartup(`decode ${label} resolved in ${elapsed}ms`);
+    if (light) {
+      this.lightBuffer = decoded;
+    } else {
+      this.defaultBuffer = decoded;
+    }
     this.loadStage = 'ready';
     perfMark('audio-decode-end');
     return decoded;
@@ -444,6 +564,7 @@ export class AudioEngine {
 
     this.stopTrack();
 
+    this.setPhase('starting');
     this.trackBuffer = audioBuffer;
     this.currentBpm = bpm;
     if (options.approachBeats !== undefined && Number.isFinite(options.approachBeats)) {
