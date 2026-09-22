@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { fetchBytesWithProgress, FetchStalledError } from '../fetchBytes';
+import { fetchBytesWithProgress, FetchStalledError, withTimeout } from '../fetchBytes';
 
 function mockResponse(chunks: Uint8Array[], opts: { ok?: boolean; status?: number } = {}) {
   const { ok = true, status = 200 } = opts;
@@ -66,5 +66,23 @@ describe('fetchBytesWithProgress', () => {
     })));
     const out = await fetchBytesWithProgress('http://x/old.mp3');
     expect(new Uint8Array(out)).toEqual(new Uint8Array([7, 8]));
+  });
+});
+
+describe('withTimeout (decode watchdog shape)', () => {
+  it('passes fast resolutions through untouched', async () => {
+    await expect(withTimeout(Promise.resolve(42), 50, () => new Error('x'))).resolves.toBe(42);
+  });
+
+  it('passes rejections through untouched', async () => {
+    await expect(
+      withTimeout(Promise.reject(new Error('boom')), 50, () => new Error('x'))
+    ).rejects.toThrow('boom');
+  });
+
+  it('rejects a hung promise after the timeout (game starts via fallback)', async () => {
+    await expect(
+      withTimeout(new Promise<never>(() => {}), 20, () => new Error('decode too slow'))
+    ).rejects.toThrow('decode too slow');
   });
 });

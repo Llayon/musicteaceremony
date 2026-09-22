@@ -33,6 +33,27 @@ export class FetchStalledError extends Error {
   }
 }
 
+/**
+ * Races any promise against a timeout so Start can never hang on an
+ * unsettling async op (e.g. decodeAudioData of 159 s stereo on a
+ * low-memory phone, which has no abort API). On timeout the race rejects
+ * but the original promise keeps running — a late success is simply
+ * ignored by the racer (callers may still cache it via .then).
+ */
+export function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  makeError: () => Error
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(makeError()), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    clearTimeout(timer);
+  });
+}
+
 const DEFAULT_STALL_TIMEOUT_MS = 15_000;
 
 export async function fetchBytesWithProgress(

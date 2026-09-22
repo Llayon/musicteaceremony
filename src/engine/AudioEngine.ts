@@ -1,11 +1,17 @@
 import type { ChartEvent } from '../types';
 import { TimingClock } from './TimingClock';
 import { DEFAULT_TRACK_URL } from './defaultTrack';
-import { fetchBytesWithProgress, type FetchBytesProgress } from './fetchBytes';
+import { fetchBytesWithProgress, withTimeout, type FetchBytesProgress } from './fetchBytes';
 import { perfMark } from './perf';
 
 /** Telemetry-only loading stage (never drives game logic). */
 export type AudioLoadStage = 'idle' | 'downloading' | 'decoding' | 'ready' | 'error';
+
+/**
+ * Decode watchdog: past this the game starts on the fallback loop instead
+ * of waiting forever (decodeAudioData cannot be aborted).
+ */
+export const DECODE_TIMEOUT_MS = 60_000;
 
 export interface StartTrackOptions {
   /** Loop the buffer (used for the dev guide-loop fallback). Default false. */
@@ -266,6 +272,11 @@ export class AudioEngine {
    * bytes when available, otherwise fetches first. Throws when the asset
    * is missing so callers can fall back explicitly (dev guide loop)
    * instead of silently synthesizing 160 s on the tap path.
+   *
+   * Decode watchdog: decodeAudioData has no abort API and can stall
+   * indefinitely on low-memory phones (159 s stereo is ~120 MB PCM).
+   * Past DECODE_TIMEOUT_MS the race rejects → caller falls back and the
+   * game starts; a late-resolving decode still caches for the next round.
    */
   public async loadDefaultTrack(): Promise<AudioBuffer> {
     if (this.defaultBuffer) return this.defaultBuffer;
@@ -278,7 +289,27 @@ export class AudioEngine {
       const bytes = this.preloadedBytes ?? (await this.preloadDefaultTrackBytes());
       // Slice: decodeAudioData may detach the input in some browsers —
       // the cached copy stays intact for potential re-decodes.
-      const decoded = await ctx.decodeAudioData(bytes.slice(0));
+      const decodePromise = ctx.decodeAudioData(bytes.slice(0));
+      // A late success still warms the cache for the next round.
+      void decodePromise.then(
+        (buf) => {
+          if (!this.defaultBuffer) {
+            this.defaultBuffer = buf;
+          }
+        },
+        () => {
+          // Already handled via the race below; never unhandled.
+        }
+      );
+      const decoded = await withTimeout(
+        decodePromise,
+        DECODE_TIMEOUT_MS,
+        () =>
+          new Error(
+            `Decoding the default track took longer than ${(DECODE_TIMEOUT_MS / 1000).toFixed(0)} s — ` +
+              `this phone may be too slow for 159 s of stereo. Falling back.`
+          )
+      );
       this.defaultBuffer = decoded;
       this.loadStage = 'ready';
       perfMark('audio-decode-end');
