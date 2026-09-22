@@ -6,6 +6,7 @@ import { VisualEngine } from '../engine/VisualEngine';
 import { TIMING_WINDOWS } from '../engine/timing';
 import { ChartEvent, GameScore } from '../types';
 import { ZEN_CHART_METADATA, getFreshChartEvents, getLastEventTimeMs } from '../data/zenChart';
+import { perfMark } from '../engine/perf';
 import { TMAService } from '../services/tma';
 
 type GameState = 'IDLE' | 'PLAYING' | 'PAUSED' | 'FINISHED';
@@ -37,8 +38,11 @@ export const RhythmGame: React.FC = () => {
   const [userOffsetMs, setUserOffsetMs] = useState<number>(0);
   const [showSettings, setShowSettings] = useState<boolean>(false);
   const [isTmaActive, setIsTmaActive] = useState<boolean>(false);
-  const [songProgress, setSongProgress] = useState<number>(0);
   const [isMuted, setIsMuted] = useState<boolean>(false);
+  // Song progress bypasses React state: written straight to the DOM node
+  // every frame so PLAYING re-renders only on game events (taps/misses).
+  // Pixi stays the sole 60 FPS renderer.
+  const progressFillRef = useRef<HTMLDivElement>(null);
   const [isLoadingAudio, setIsLoadingAudio] = useState<boolean>(false);
   const [audioError, setAudioError] = useState<string | null>(null);
   const [activeTrackLabel, setActiveTrackLabel] = useState<string>('default song');
@@ -107,12 +111,20 @@ export const RhythmGame: React.FC = () => {
   // Initialize Engines & Telegram WebApp (StrictMode-safe: full cleanup).
   useEffect(() => {
     let cancelled = false;
+    perfMark('app-mounted');
 
     const tmaDetected = TMAService.init();
     setIsTmaActive(tmaDetected);
 
     const audio = new AudioEngine();
     audioEngineRef.current = audio;
+
+    // Stage-1 preload: fetch song bytes while the user reads the start
+    // screen. No AudioContext here (autoplay-safe). Failures are silent —
+    // Start falls back to the badged dev guide loop.
+    audio.preloadDefaultTrackBytes().catch(() => {
+      // Intentionally silent: loading state is resolved at Start time.
+    });
 
     const visual = new VisualEngine(audio);
     visualEngineRef.current = visual;
@@ -126,6 +138,7 @@ export const RhythmGame: React.FC = () => {
           visual.setBpm(ZEN_CHART_METADATA.bpm);
           visual.setApproachBeats(ZEN_CHART_METADATA.approachBeats);
           visual.setFirstBeatOffsetMs(ZEN_CHART_METADATA.firstBeatOffsetMs);
+          perfMark('pixi-ready');
         }
       }).catch((err) => {
         console.error('[VisualEngine] Initialization error:', err);
@@ -158,9 +171,12 @@ export const RhythmGame: React.FC = () => {
       const songTimeMs = audio.getExactSongTime();
 
       // Update progress bar against the effective (real-buffer) duration.
+      // Direct DOM write (no React state): zero re-renders from the loop.
       const durationMs = getEffectiveDurationMs();
-      const progress = durationMs > 0 ? Math.min(100, (songTimeMs / durationMs) * 100) : 0;
-      setSongProgress(progress);
+      const progress = durationMs > 0 ? Math.min(1, songTimeMs / durationMs) : 0;
+      if (progressFillRef.current) {
+        progressFillRef.current.style.transform = `scaleX(${progress})`;
+      }
 
       // Check for missed notes (raw audio time — calibration never shifts this).
       const misses: JudgeResult[] = judge.checkMissedNotes(songTimeMs, eventsRef.current);
@@ -196,6 +212,7 @@ export const RhythmGame: React.FC = () => {
     const visual = visualEngineRef.current;
     if (!audio || !judge || !visual || isLoadingAudio) return;
 
+    perfMark('start-click');
     cancelGameLoop();
     setIsLoadingAudio(true);
     setAudioError(null);
@@ -215,7 +232,9 @@ export const RhythmGame: React.FC = () => {
       const initialScore = judge.resetScore();
       setScore(initialScore);
       setLastDelta(null);
-      setSongProgress(0);
+      if (progressFillRef.current) {
+        progressFillRef.current.style.transform = 'scaleX(0)';
+      }
 
       // Resolve the genuine active track:
       // 1) uploaded custom audio when present, 2) pre-rendered 90 BPM master
@@ -245,6 +264,7 @@ export const RhythmGame: React.FC = () => {
         approachBeats: ZEN_CHART_METADATA.approachBeats,
         onEnded: () => finishRound(),
       });
+      perfMark('track-start');
       setGameState('PLAYING');
 
       cancelGameLoop();
@@ -436,12 +456,13 @@ export const RhythmGame: React.FC = () => {
         </div>
       </section>
 
-      {/* Song Timeline Progress */}
+      {/* Song Timeline Progress (updated via ref — no React re-renders) */}
       <div id="timeline-progress" className="relative z-20 w-full px-4">
         <div className="w-full h-1 bg-[#2C2723] rounded-full overflow-hidden">
           <div
-            className="h-full bg-gradient-to-r from-[#6E9855] via-[#84D984] to-[#FCE786] transition-all duration-75"
-            style={{ width: `${songProgress}%` }}
+            ref={progressFillRef}
+            className="h-full w-full origin-left bg-gradient-to-r from-[#6E9855] via-[#84D984] to-[#FCE786]"
+            style={{ transform: 'scaleX(0)' }}
           />
         </div>
         <div className="mt-1 text-[10px] font-mono text-[#8C8375] truncate">Трек: {activeTrackLabel}</div>

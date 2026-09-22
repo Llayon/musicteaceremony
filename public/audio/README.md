@@ -19,7 +19,9 @@ use `/musicteaceremony/`).
 
 - Content: Rhodes & Rimshot Groove master (drums + bass + other; the
   supplied vocals stem is digitally silent and is excluded)
-- Format: MP3, stereo, 48 kHz, ~192 kbps, 3 817 871 bytes
+- Format: MP3, stereo, 48 kHz, 160 kbps CBR, 3 181 584 bytes
+  (transcoded from the supplied 192 kbps master via
+  `ffmpeg -codec:a libmp3lame -b:a 160k`; duration bit-identical)
 - Duration: 159.018667 s (`songLengthMs: 159019`)
 - Tempo: 90 BPM, 4/4, constant end-to-end (drift ≈ −0.12 ms/s)
 - Grid: beat k at 40 + k × 666.666… ms; groove bar 1 = 10 040 ms
@@ -41,9 +43,9 @@ applied — the supplied mix is committed as-is.
   `AudioEngine.generateDevGuideLoop()` — a tiny (~3.7 s) looped metronome
   so gameplay stays fast and testable. The HUD badges this as
   `dev guide loop (asset missing — see public/audio/README)`.
-- `AudioEngine.generateZenSoundtrack()` is retained **dev-only** for
-  sound-design iteration and short previews. It warns for durations over
-  30 s and must not be called on the Start path.
+- `src/dev/generateZenSoundtrack.ts` is retained **dev-only** (not imported
+  by production code) for sound-design iteration and short previews. It
+  warns for durations over 30 s and must not be called on the Start path.
 - Custom user uploads (MP3/WAV via the settings modal) genuinely become
   the active gameplay track through `setCustomTrackFromBytes()`. Chart
   compatibility limit: the chart stays fixed to the 90 BPM production
