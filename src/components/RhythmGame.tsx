@@ -347,22 +347,43 @@ export const RhythmGame: React.FC = () => {
     }
   };
 
+  // Canonical Start action — the ONE entry point for IDLE/FINISHED taps.
+  // Runs the synchronous in-gesture unlock first (iOS honors resume() best
+  // inside the trusted gesture), then the async startup which reuses the
+  // same in-flight unlock. Guarded against double-trigger (pointerdown +
+  // click, button + wrapper fallback all funnel here exactly once).
+  // Plain function (fresh closure per render — no stale startRound).
+  const startGuardRef = useRef(false);
+  const handleStartAction = (e?: React.SyntheticEvent) => {
+    e?.stopPropagation();
+    const audio = audioEngineRef.current;
+    if (!audio || startGuardRef.current) return;
+    // Single-flight gesture unlock, synchronously in this tap.
+    // Rejection is swallowed here on purpose: startRound() awaits the
+    // same shared unlock and surfaces the error through audioError.
+    audio.gestureUnlock().catch(() => {});
+    startGuardRef.current = true;
+    void startRound().finally(() => {
+      startGuardRef.current = false;
+    });
+  };
+
   // Primary Gameplay Tap Handler (audio-clock synchronized timing).
   // Uses PointerEvent.timeStamp mapped through TimingClock where feasible,
   // with a safe fallback to the audio clock sampled in the handler.
   const handlePointerDown = (e: React.PointerEvent) => {
-    e.preventDefault();
-
-    // Synchronous in-gesture unlock FIRST: iOS Safari honors resume() best
-    // when called directly in the tap, not after awaits. No-op when running.
-    audioEngineRef.current?.unlockSynchronously();
-
     if (gameState === 'IDLE' || gameState === 'FINISHED') {
-      void startRound();
+      // Start path: NO preventDefault here — nothing must disturb the
+      // trusted gesture before the synchronous unlock runs in the button
+      // handler (target phase, before this bubble handler).
+      handleStartAction(e);
       return;
     }
 
     if (gameState !== 'PLAYING') return;
+
+    // Gameplay taps only: prevent scroll/zoom interference.
+    e.preventDefault();
 
     const audio = audioEngineRef.current;
     const judge = inputJudgeRef.current;
@@ -649,6 +670,8 @@ export const RhythmGame: React.FC = () => {
               type="button"
               disabled={isLoadingAudio}
               className="px-8 py-3.5 rounded-xl bg-gradient-to-r from-[#6E9855] to-[#487334] text-white font-bold text-sm tracking-wider uppercase shadow-lg shadow-[#487334]/40 hover:brightness-110 active:scale-95 transition-transform disabled:opacity-60"
+              onPointerDown={(e) => handleStartAction(e)}
+              onClick={(e) => handleStartAction(e)}
             >
               {isLoadingAudio ? phaseText(startupPhase, loadProgress) : 'Коснитесь экрана для старта'}
             </button>
@@ -718,11 +741,8 @@ export const RhythmGame: React.FC = () => {
               type="button"
               disabled={isLoadingAudio}
               className="px-8 py-3.5 rounded-xl bg-gradient-to-r from-[#6E9855] to-[#487334] text-white font-bold text-sm tracking-wider uppercase shadow-lg shadow-[#487334]/40 hover:brightness-110 active:scale-95 transition-transform flex items-center space-x-2 disabled:opacity-60"
-              onPointerDown={(e) => e.stopPropagation()}
-              onClick={(e) => {
-                e.stopPropagation();
-                void startRound();
-              }}
+              onPointerDown={(e) => handleStartAction(e)}
+              onClick={(e) => handleStartAction(e)}
             >
               <RotateCcw className="w-4 h-4" />
               <span>

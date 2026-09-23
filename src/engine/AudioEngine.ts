@@ -196,51 +196,81 @@ export class AudioEngine {
     return this.audioCtx;
   }
 
+  // Single-flight unlock: at most ONE native ctx.resume() per unlock
+  // attempt, shared by the gesture path and every async waiter. Set
+  // synchronously when a cycle starts; cleared on settle.
+  private resumePromise: Promise<void> | null = null;
+
   /**
-   * Synchronous in-gesture unlock attempt. Call FIRST in the pointerdown
-   * handler, before any async work: iOS Safari honors resume() best when it
-   * is invoked synchronously inside the user gesture, not after awaits.
-   * Fire-and-forget by design — the awaited resumeContext() later verifies.
-   * Safe to call on every tap (no-op when already running).
+   * Canonical gesture unlock. Call synchronously FIRST in the Start tap
+   * handler, before any async work: iOS Safari honors resume() best inside
+   * the trusted gesture. Creates/reuses the context, requests resume
+   * exactly once per attempt, fires the silent unlock probe, and returns
+   * the shared in-flight promise for async code to await.
+   * Safe to call on every tap (no-op when already running; reuses the
+   * in-flight unlock when one is pending — never a second native resume).
    */
-  public unlockSynchronously(): void {
-    try {
-      const ctx = this.ensureContext();
-      if (ctx.state === 'running') return;
-      this.logStartup(`sync unlock attempted (state=${ctx.state})`);
-      const result = ctx.resume() as unknown;
-      // Old webkitAudioContext.resume() returns void, not a promise.
-      if (result && typeof (result as Promise<void>).then === 'function') {
-        (result as Promise<void>).then(
-          () => this.logStartup(`sync unlock resolved (state=${ctx.state})`),
-          (err: unknown) =>
-            this.logStartup(`sync unlock rejected: ${err instanceof Error ? err.message : String(err)}`)
-        );
-      }
-    } catch (err) {
-      this.logStartup(
-        `sync unlock threw: ${err instanceof Error ? err.message : String(err)}`
-      );
+  public gestureUnlock(): Promise<void> {
+    const ctx = this.ensureContext();
+    this.logStartup('start gesture');
+    this.logStartup(`initial state=${ctx.state}`);
+    if (ctx.state === 'running') {
+      this.logStartup('already running — no resume, no probe');
+      return Promise.resolve();
     }
+    if (this.resumePromise) {
+      this.logStartup('resumePromise reused (in-flight unlock, no new resume)');
+      return this.resumePromise;
+    }
+    return this.startUnlockCycle(true);
   }
 
   /**
-   * Initializes or resumes AudioContext to bypass mobile autoplay restrictions.
-   * Resume is attempted for ANY non-running state (suspended AND WebKit's
-   * 'interrupted' — checking only 'suspended' silently skips the resume call
-   * on iOS and hands a dead context downstream). After resume resolves the
-   * state is VERIFIED: a resolved promise with a still-dead context throws
-   * an actionable error instead of starting a silently frozen game.
+   * Async unlock for non-gesture code paths (decode, upload). Shares the
+   * same single-flight state machine: reuses an in-flight gesture unlock
+   * instead of issuing a competing resume(). No probe outside gestures.
    */
   public async resumeContext(): Promise<AudioContext> {
     const ctx = this.ensureContext();
+    if (ctx.state === 'running') return ctx;
+    if (this.resumePromise) {
+      this.logStartup('resumePromise reused (in-flight unlock, no new resume)');
+      await this.resumePromise;
+      return ctx;
+    }
+    await this.startUnlockCycle(false);
+    return ctx;
+  }
 
-    if (ctx.state !== 'running') {
-      const before = ctx.state;
-      this.logStartup(`resume called (state before=${before})`);
+  /**
+   * Starts one unlock cycle: exactly ONE native resume() call plus (for
+   * gesture cycles) one silent probe. Stores the promise synchronously so
+   * any concurrent caller reuses it. Clears itself on settle.
+   */
+  private startUnlockCycle(withProbe: boolean): Promise<void> {
+    const ctx = this.ensureContext();
+    this.logStartup(withProbe ? 'resume requested' : 'resume requested (background, no probe)');
+
+    let native: Promise<void>;
+    try {
+      const result = ctx.resume() as unknown;
+      // Old webkitAudioContext.resume() returns void, not a promise.
+      native =
+        result && typeof (result as Promise<void>).then === 'function'
+          ? (result as Promise<void>)
+          : Promise.resolve();
+    } catch (err) {
+      native = Promise.reject(err);
+    }
+
+    if (withProbe) {
+      this.startUnlockProbe(ctx);
+    }
+
+    const cycle = (async (): Promise<void> => {
       try {
         await withTimeout(
-          ctx.resume(),
+          native,
           RESUME_TIMEOUT_MS,
           () =>
             new Error(
@@ -254,10 +284,8 @@ export class AudioEngine {
         );
         throw err;
       }
-      this.logStartup(`resume resolved (state after=${ctx.state})`);
-      // Read through a helper: direct comparison would hit control-flow
-      // narrowing (the pre-await check excluded 'running' from ctx.state).
       const after = readContextState(ctx);
+      this.logStartup(`resume resolved (state after=${after})`);
       if (after !== 'running') {
         const msg =
           `Audio did not start (context state="${after}" after resume). ` +
@@ -266,9 +294,53 @@ export class AudioEngine {
         this.logStartup(`resume ineffective: state=${after}`);
         throw new Error(msg);
       }
-    }
+    })();
 
-    return ctx;
+    const tracked = cycle.then(
+      () => {
+        if (this.resumePromise === tracked) this.resumePromise = null;
+      },
+      (err: unknown) => {
+        if (this.resumePromise === tracked) this.resumePromise = null;
+        throw err;
+      }
+    );
+    this.resumePromise = tracked;
+    return tracked;
+  }
+
+  /**
+   * Silent iOS unlock probe: a 1-sample all-zeros buffer started through a
+   * zero-gain node. Inaudible by construction (no samples, no gain path),
+   * started synchronously in the trusted gesture to help WebKit honor the
+   * unlock. Touches neither the gameplay clock nor master/SFX volumes;
+   * nodes disconnect onended (no leak). Runs at most once per unlock
+   * cycle — in-flight reuse never re-probes, running needs no probe.
+   */
+  private startUnlockProbe(ctx: AudioContext): void {
+    try {
+      const buffer = ctx.createBuffer(1, 1, ctx.sampleRate);
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      const zeroGain = ctx.createGain();
+      zeroGain.gain.value = 0;
+      source.connect(zeroGain);
+      zeroGain.connect(ctx.destination);
+      source.onended = () => {
+        try {
+          source.disconnect();
+          zeroGain.disconnect();
+        } catch {
+          // Best-effort cleanup only.
+        }
+      };
+      source.start();
+      this.logStartup('unlock probe started (1-sample silence, zero-gain)');
+    } catch (err) {
+      this.logStartup(
+        `unlock probe failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
   }
 
   public getTimingClock(): TimingClock {
@@ -616,6 +688,7 @@ export class AudioEngine {
     this.stopTrack();
 
     this.setPhase('starting');
+    this.logStartup('track started');
     this.trackBuffer = audioBuffer;
     this.currentBpm = bpm;
     if (options.approachBeats !== undefined && Number.isFinite(options.approachBeats)) {
