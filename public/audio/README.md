@@ -11,9 +11,9 @@ public/audio/zen-tea-ceremony.mp3         stereo 160 kbps, 3 181 584 bytes
 public/audio/zen-tea-ceremony.light.mp3   mono 128 kbps, 2 545 296 bytes
 ```
 
-Both decode to 159.018667 s. The light mix is a mono fold-down for weak
-phones (~30 MB PCM instead of ~61 MB); the engine tries stereo first and
-falls back automatically, badging it as `default song (light mix)`.
+Both decode to 159.018667 s. The light mix is a mono fold-down kept as a
+decode fallback (~30 MB PCM instead of ~61 MB); the engine tries stereo
+first and falls back automatically, badging it as `default song (light mix)`.
 
 Served at runtime as `<base>/audio/zen-tea-ceremony.mp3` (see
 `src/engine/defaultTrack.ts` → `DEFAULT_TRACK_URL`, which resolves through

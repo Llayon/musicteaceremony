@@ -133,7 +133,7 @@ describe('GAUNTLET 1.2 — single-flight iOS unlock', () => {
     expect(countLines(engine.getStartupLog(), 'resumePromise reused')).toBe(2);
   });
 
-  it('C. second tap while unlock pending: one resume, one probe', async () => {
+  it('C. concurrent second gesture while unlock pending: one resume, one probe', async () => {
     const { spy, triggerResume } = installFakeAudio('suspended', 'manual');
     const engine = new AudioEngine();
     const p1 = engine.gestureUnlock();

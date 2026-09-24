@@ -300,7 +300,7 @@ export const RhythmGame: React.FC = () => {
 
       // Resolve the genuine active track:
       // 1) uploaded custom audio when present, 2) pre-rendered 90 BPM master
-      // (stereo, then automatic light-mono fallback on weak phones),
+      // (stereo, then automatic light-mono decode fallback),
       // 3) tiny looped dev guide when audio genuinely cannot load.
       // Chart compatibility limit: the chart stays fixed to the 90 BPM
       // production groove — custom audio is NOT re-mapped and there is no
@@ -312,8 +312,8 @@ export const RhythmGame: React.FC = () => {
       } else {
         try {
           trackBuffer = await audio.loadDefaultTrack();
-          // Layered fallback may resolve the light mono mix on weak phones —
-          // same music, half the decode weight. Badged honestly.
+          // Layered fallback may resolve the light mono mix as a decode
+          // fallback — same music, half the decode weight. Badged honestly.
           setActiveTrackLabel(
             audio.usedLightTrack() ? 'default song (light mix)' : 'default song'
           );

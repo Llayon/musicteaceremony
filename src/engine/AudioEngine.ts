@@ -87,7 +87,7 @@ export class AudioEngine {
 
   private defaultBuffer: AudioBuffer | null = null;
   private defaultPromise: Promise<AudioBuffer> | null = null;
-  // Light mono fallback (weak phones): fetched on demand, cached per session.
+  // Light mono fallback (decode fallback): fetched on demand, cached per session.
   private lightBytes: ArrayBuffer | null = null;
   private lightBuffer: AudioBuffer | null = null;
   private lastUsedLight = false;
@@ -287,8 +287,8 @@ export class AudioEngine {
           RESUME_TIMEOUT_MS,
           () =>
             new Error(
-              'Sound unlock timed out: the browser did not resume audio. ' +
-                'Tap Start again (a real tap, not auto-play).'
+              'Sound unlock timed out: the browser did not resume audio within 10 s. ' +
+                'Try Start once more; if it repeats, send the startup log from settings.'
             )
         );
       } catch (err) {
@@ -302,8 +302,8 @@ export class AudioEngine {
       if (after !== 'running') {
         const msg =
           `Audio did not start (context state="${after}" after resume). ` +
-          `На iPhone помогает: повторный тап по Start, перезагрузка страницы, ` +
-          `Safari напрямую вместо встроенного браузера.`;
+          `Если повторяется: перезагрузка страницы, Safari напрямую вместо ` +
+          `встроенного браузера, лог из «Диагностики запуска» в настройках.`;
         this.logStartup(`resume ineffective: state=${after}`);
         throw new Error(msg);
       }
@@ -528,7 +528,7 @@ export class AudioEngine {
    * Stage 2 — runs on Start (after the user gesture): reuses preloaded
    * bytes when available, otherwise fetches first.
    *
-   * Layered fallback (weak phones): full stereo first (~61 MB PCM); when
+   * Layered fallback (decode fallback): full stereo first (~61 MB PCM); when
    * its fetch or decode fails, the light mono mix (~30 MB PCM) is tried.
    * Only when both fail does the caller fall back to the badged dev guide
    * loop. Throws in that case — never hangs: fetch is stall-bounded and
@@ -563,7 +563,7 @@ export class AudioEngine {
         this.setPhase('ready');
         return decoded;
       } catch (stereoErr) {
-        // Layer 2: light mono mix. Kinder to weak-phone decoders.
+        // Layer 2: light mono mix. Decode fallback when stereo fails.
         perfMark('audio-light-fallback');
         this.logStartup(
           `stereo layer failed: ${stereoErr instanceof Error ? stereoErr.message : String(stereoErr)}`
