@@ -348,20 +348,30 @@ export const RhythmGame: React.FC = () => {
   };
 
   // Canonical Start action — the ONE entry point for IDLE/FINISHED taps.
-  // Runs the synchronous in-gesture unlock first (iOS honors resume() best
-  // inside the trusted gesture), then the async startup which reuses the
-  // same in-flight unlock. Guarded against double-trigger (pointerdown +
-  // click, button + wrapper fallback all funnel here exactly once).
+  // CLICK-ONLY by experiment (GAUNTLET 1.2b): Safari may not honor resume()
+  // from pointerdown; a real click is the documented Web Audio gesture.
+  // Runs the synchronous in-gesture unlock first, then the async startup
+  // which reuses the same in-flight unlock. Guarded against double-trigger.
   // Plain function (fresh closure per render — no stale startRound).
   const startGuardRef = useRef(false);
   const handleStartAction = (e?: React.SyntheticEvent) => {
     e?.stopPropagation();
     const audio = audioEngineRef.current;
     if (!audio || startGuardRef.current) return;
-    // Single-flight gesture unlock, synchronously in this tap.
-    // Rejection is swallowed here on purpose: startRound() awaits the
-    // same shared unlock and surfaces the error through audioError.
-    audio.gestureUnlock().catch(() => {});
+    // Gesture facts for the diagnostic log (proves a real trusted click).
+    // Synchronous — nothing (no await, no setState) runs before this.
+    const userActivation =
+      typeof navigator !== 'undefined'
+        ? (navigator as Navigator & { userActivation?: { isActive?: boolean } }).userActivation
+            ?.isActive ?? null
+        : null;
+    audio
+      .gestureUnlock({
+        event: e?.type ?? 'unknown',
+        isTrusted: e?.isTrusted ?? false,
+        userActivation,
+      })
+      .catch(() => {});
     startGuardRef.current = true;
     void startRound().finally(() => {
       startGuardRef.current = false;
@@ -372,11 +382,11 @@ export const RhythmGame: React.FC = () => {
   // Uses PointerEvent.timeStamp mapped through TimingClock where feasible,
   // with a safe fallback to the audio clock sampled in the handler.
   const handlePointerDown = (e: React.PointerEvent) => {
+    // Startup NO LONGER starts here by experiment (GAUNTLET 1.2b): while
+    // IDLE/FINISHED a wrapper pointerdown must not initiate WebAudio — the
+    // one true Start gesture is the button click below. Taps outside the
+    // button while idle intentionally do nothing.
     if (gameState === 'IDLE' || gameState === 'FINISHED') {
-      // Start path: NO preventDefault here — nothing must disturb the
-      // trusted gesture before the synchronous unlock runs in the button
-      // handler (target phase, before this bubble handler).
-      handleStartAction(e);
       return;
     }
 
@@ -670,10 +680,9 @@ export const RhythmGame: React.FC = () => {
               type="button"
               disabled={isLoadingAudio}
               className="px-8 py-3.5 rounded-xl bg-gradient-to-r from-[#6E9855] to-[#487334] text-white font-bold text-sm tracking-wider uppercase shadow-lg shadow-[#487334]/40 hover:brightness-110 active:scale-95 transition-transform disabled:opacity-60"
-              onPointerDown={(e) => handleStartAction(e)}
               onClick={(e) => handleStartAction(e)}
             >
-              {isLoadingAudio ? phaseText(startupPhase, loadProgress) : 'Коснитесь экрана для старта'}
+              {isLoadingAudio ? phaseText(startupPhase, loadProgress) : 'Начать'}
             </button>
             {isLoadingAudio && startupPhase !== 'idle' && (
               <p className="mt-3 text-[11px] font-mono text-[#8C8375] max-w-[280px]">
@@ -741,7 +750,6 @@ export const RhythmGame: React.FC = () => {
               type="button"
               disabled={isLoadingAudio}
               className="px-8 py-3.5 rounded-xl bg-gradient-to-r from-[#6E9855] to-[#487334] text-white font-bold text-sm tracking-wider uppercase shadow-lg shadow-[#487334]/40 hover:brightness-110 active:scale-95 transition-transform flex items-center space-x-2 disabled:opacity-60"
-              onPointerDown={(e) => handleStartAction(e)}
               onClick={(e) => handleStartAction(e)}
             >
               <RotateCcw className="w-4 h-4" />

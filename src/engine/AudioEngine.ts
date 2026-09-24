@@ -209,10 +209,23 @@ export class AudioEngine {
    * the shared in-flight promise for async code to await.
    * Safe to call on every tap (no-op when already running; reuses the
    * in-flight unlock when one is pending — never a second native resume).
+   *
+   * @param source gesture facts for the diagnostic log (event type,
+   * isTrusted, userActivation) — what proves the tap was a real click.
    */
-  public gestureUnlock(): Promise<void> {
+  public gestureUnlock(source?: {
+    event?: string;
+    isTrusted?: boolean;
+    userActivation?: boolean | null;
+  }): Promise<void> {
     const ctx = this.ensureContext();
     this.logStartup('start gesture');
+    if (source) {
+      this.logStartup(
+        `event=${source.event ?? '?'} isTrusted=${String(source.isTrusted ?? '?')} ` +
+          `userActivation.isActive=${String(source.userActivation ?? '?')}`
+      );
+    }
     this.logStartup(`initial state=${ctx.state}`);
     if (ctx.state === 'running') {
       this.logStartup('already running — no resume, no probe');

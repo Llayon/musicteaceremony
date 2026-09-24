@@ -229,4 +229,19 @@ describe('GAUNTLET 1.2 — single-flight iOS unlock', () => {
     ).toBe(true);
   });
 
+  it('J. gesture facts land in the log (click / isTrusted / userActivation)', async () => {
+    installFakeAudio('suspended', 'flip-to-running');
+    const engine = new AudioEngine();
+    await engine.gestureUnlock({ event: 'click', isTrusted: true, userActivation: true });
+    expect(engine.getStartupLog().join('\n')).toMatch(
+      /event=click isTrusted=true userActivation\.isActive=true/
+    );
+  });
+
+  it('K. gestureUnlock without source still works (backwards compatible)', async () => {
+    installFakeAudio('suspended', 'flip-to-running');
+    const engine = new AudioEngine();
+    await engine.gestureUnlock();
+    expect(engine.getStartupLog().join('\n')).toMatch(/start gesture/);
+  });
 });
